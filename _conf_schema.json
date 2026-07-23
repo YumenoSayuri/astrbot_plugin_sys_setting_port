@@ -1,0 +1,132 @@
+{
+    "enable_custom_waiter": {
+        "description": "启用自定义等待机制",
+        "hint": "开启后将接管「只 @ 机器人」的等待逻辑。⚠️ 请务必先在系统设置中关闭原有的「只 @ 机器人是否触发等待」！",
+        "type": "bool",
+        "default": false
+    },
+    "waiter_timeout": {
+        "description": "自定义等待时间 (秒)",
+        "hint": "只 @ 机器人后，等待用户发送下一条消息的超时时间。",
+        "type": "int",
+        "default": 60
+    },
+    "waiter_need_reply": {
+        "description": "等待期间是否回复",
+        "hint": "开启后，在等待期间会先回复一句（如“想要问什么呢？”）可自定义等待词。",
+        "type": "bool",
+        "default": true
+    },
+    "waiter_reply_text": {
+        "description": "自定义等待回复词",
+        "hint": "当开启等待期间回复时，机器人发送的提示文本。",
+        "type": "string",
+        "default": "想要问什么呢？😄"
+    },
+    "wake_on_timeout": {
+        "description": "超时后是否强制唤醒",
+        "hint": "如果在等待时间内用户没有发送下一条消息，是否直接以空消息唤醒 AI 进行回复（主动找话题/卖萌）。",
+        "type": "bool",
+        "default": false
+    },
+    "enable_proactive_chat": {
+        "description": "启用私聊主动回复",
+        "hint": "开启后，当私聊闲置超过设定时间，机器人会主动发送消息找用户聊天。此功能走标准事件流，可完美触发其他插件（如语音、表情包）。",
+        "type": "bool",
+        "default": false
+    },
+    "proactive_allowed_users": {
+        "description": "允许主动回复的用户列表",
+        "hint": "只有在此列表中明确配置的私聊用户（填写 QQ 号/用户 ID），才会获得主动消息服务。留空则不给任何人发送。",
+        "type": "list",
+        "default": []
+    },
+    "proactive_mode": {
+        "description": "主动回复触发模式",
+        "hint": "【纯随机模式】在最小和最大间隔之间随机取一个时间触发。【智能判定模式】每隔最小间隔时间，调用判定模型决定是否触发；若一直不触发，达到最大间隔时强制触发。",
+        "type": "string",
+        "default": "纯随机模式",
+        "options": ["纯随机模式", "智能判定模式"]
+    },
+    "proactive_judge_provider": {
+        "description": "智能判定模型 (仅智能模式有效)",
+        "hint": "选择用于判定“现在是否适合主动聊天”的轻量级模型。建议选择速度快、成本低的模型。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "proactive_judge_prompt": {
+        "description": "智能判定提示词 (仅智能模式有效)",
+        "hint": "发送给判定模型的提示词。模型只需回答“是”或“否”。",
+        "type": "string",
+        "default": "你是一个情感分析助手。请根据当前的聊天氛围和时间，判断现在是否适合主动找用户聊天。如果适合，请只回答“是”；如果不适合（比如刚聊完不久、或者氛围比较沉重），请只回答“否”。不要输出任何其他内容。"
+    },
+    "proactive_min_interval": {
+        "description": "最小触发间隔 (分钟)",
+        "hint": "【随机模式】随机时间的下限。【智能模式】每隔此时间调用一次判定模型。",
+        "type": "int",
+        "default": 30
+    },
+    "proactive_max_interval": {
+        "description": "最大触发间隔 (分钟)",
+        "hint": "【随机模式】随机时间的上限。【智能模式】达到此时间后，无视判定模型强制触发。",
+        "type": "int",
+        "default": 120
+    },
+    "proactive_dnd_time": {
+        "description": "免打扰时段 (24小时制)",
+        "hint": "格式：开始-结束，例如 23-7 表示晚上 11 点到早上 7 点。在此时间段内不会发送主动消息。",
+        "type": "string",
+        "default": "23-7"
+    },
+    "proactive_max_unanswered": {
+        "description": "最大未回复次数上限",
+        "hint": "当 Bot 连续发送 N 次主动消息用户都未回复后，将暂停主动消息，直到用户下次回复。填 0 则不限制。",
+        "type": "int",
+        "default": 3
+    },
+    "proactive_prompt": {
+        "description": "主动回复触发提示词",
+        "hint": "支持占位符：{{current_time}} (当前时间), {{unanswered_count}} (未回复次数)。",
+        "type": "string",
+        "default": "[系统任务：主动对话]\n你被授权在私聊中发起一次“主动消息”。你的回复必须完全符合你的人格设定，并严格遵守所有的输出规则。\n\n[情景分析]\n- 我们好像已经有一段时间没有说话了，我应该主动打破沉默，让他知道我想他了。\n- 当前时间是: {{current_time}}。\n- 我之前已经主动找过他，但他没有回复的次数是: {{unanswered_count}} 次。如果这个次数大于0，我的语气应该带上一点点不易察觉的失落和困惑。\n\n[行动指南]\n1.  首先，回顾我们的聊天记录，看看我们最后在聊什么。\n2.  如果上次的话题已经结束了，我可以关心一下他现在在做什么。\n3.  我可以向他提出一个我一直以来都很好奇的问题。\n4.  如果实在不知道该说什么，就直接表达我想他的心情也可以。\n\n[最终指令]\n请综合以上所有信息，用最像你自己的、最自然的方式，生成一句主动聊天的开场白。"
+    },
+    "caption_provider_id": {
+        "description": "多模态转述模型",
+        "hint": "选择用于看图并生成文字描述的模型提供商 ID。留空则不启用转述。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "fallback_provider_id": {
+        "description": "兜底次选转述模型",
+        "hint": "当主转述模型重试全部失败时，使用的备用模型提供商 ID。留空则不使用兜底。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "target_models": {
+        "description": "需要转述的模型列表",
+        "hint": "在此列表中添加需要被转述的纯文本模型名称（例如：gpt-3.5-turbo, deepseek-v3）。支持模糊匹配，只要当前模型名称包含列表中的关键词（不区分大小写）即可触发转述。",
+        "type": "list",
+        "default": []
+    },
+    "caption_prompt": {
+        "description": "图片转述提示词",
+        "hint": "发送给多模态模型的提示词，用于指导其如何描述图片。",
+        "type": "string",
+        "default": "请详细描述这张图片的内容，以便纯文本模型能够理解。"
+    },
+    "max_retries": {
+        "description": "最大重试次数",
+        "hint": "当转述模型返回空、报错或包含特定道歉词汇时，自动重试的次数。",
+        "type": "int",
+        "default": 3
+    },
+    "retry_keywords": {
+        "description": "触发重试的关键词",
+        "hint": "如果转述模型的回复中包含这些关键词，将被视为转述失败并触发重试。",
+        "type": "list",
+        "default": ["抱歉", "对不起", "无法", "sorry", "apologize", "error", "失败", "不能"]
+    }
+}
