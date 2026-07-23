@@ -64,16 +64,22 @@ class SysSettingPortPlugin(Star):
         # 只要我们清理了自己的任务，插件就能安全退出。
 
     # ==================== 群聊视觉上下文 ====================
+    def _group_context_enabled(self, event: AstrMessageEvent) -> bool:
+        return bool(
+            self.config.get("enable_group_visual_context", False)
+            and event.get_group_id()
+        )
+
     def _visual_group_enabled(self, event: AstrMessageEvent) -> bool:
-        if not self.config.get("enable_group_visual_context", False):
+        if not self._group_context_enabled(event):
             return False
-        group_id = str(event.get_group_id() or "")
+        group_id = str(event.get_group_id())
         allowed_groups = {
             str(item).strip()
             for item in self.config.get("group_visual_allowed_groups", [])
             if str(item).strip()
         }
-        return bool(group_id and group_id in allowed_groups)
+        return group_id in allowed_groups
 
     @staticmethod
     def _image_cache_key(image: Image) -> str:
@@ -160,9 +166,12 @@ class SysSettingPortPlugin(Star):
                 if comp.text:
                     parts.append(comp.text)
             elif isinstance(comp, Image):
-                caption = await self._caption_group_image(comp)
-                parts.append(f"[图片：{caption}]" if caption else "[图片：理解失败]")
-                captions.append(caption)
+                if self._visual_group_enabled(event):
+                    caption = await self._caption_group_image(comp)
+                    parts.append(f"[图片：{caption}]" if caption else "[图片：理解失败]")
+                    captions.append(caption)
+                else:
+                    parts.append("[图片]")
                 images.append(comp)
             elif isinstance(comp, At):
                 target = comp.name or comp.qq
@@ -200,7 +209,7 @@ class SysSettingPortPlugin(Star):
 
     @event_message_type(EventMessageType.GROUP_MESSAGE, priority=maxsize - 1)
     async def handle_group_visual_context(self, event: AstrMessageEvent):
-        if not self._visual_group_enabled(event):
+        if not self._group_context_enabled(event):
             return
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
@@ -701,7 +710,7 @@ class SysSettingPortPlugin(Star):
     @on_llm_request(priority=maxsize)
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         # === 群聊视觉上下文注入 ===
-        if self._visual_group_enabled(event):
+        if self._group_context_enabled(event):
             group_id = str(event.get_group_id())
             history_text = self._get_group_visual_history_text(
                 group_id,
@@ -760,20 +769,8 @@ class SysSettingPortPlugin(Star):
         quote_sources = event.get_extra("sys_setting_port_quote_sources", [])
         quote_captions = event.get_extra("sys_setting_port_quote_captions", [])
         quote_images = event.get_extra("sys_setting_port_quote_images", [])
-        if quote_images and not quote_captions and self.config.get("group_visual_provider_id"):
-            quote_captions = []
-            for image in quote_images:
-                caption = await self._caption_group_image(image)
-                if caption:
-                    quote_captions.append(caption)
-        if quote_sources:
-            source_text = "；".join(dict.fromkeys(quote_sources))
-            source_part = TextPart(
-                text=f"\n[引用图片来源：{source_text}。图片属于被引用消息中的原发送者，不是当前发言者。]"
-            )
-            req.extra_user_content_parts.insert(0, source_part)
 
-        # 引用默认只复用描述；多模态模型只有命中关键词时才重新接收原图。
+        # 先判断是否要求多模态模型重看原图，避免无意义地读取或生成描述。
         is_target_text_model = bool(
             model_name
             and any(target.lower() in model_name.lower() for target in target_models)
@@ -791,6 +788,26 @@ class SysSettingPortPlugin(Star):
             )
         )
 
+        # 未要求重看时才补充描述；要求重看时只传原图和来源信息。
+        if (
+            quote_images
+            and not quote_captions
+            and not wants_original_image
+            and self._visual_group_enabled(event)
+            and self.config.get("group_visual_provider_id")
+        ):
+            for image in quote_images:
+                caption = await self._caption_group_image(image)
+                if caption:
+                    quote_captions.append(caption)
+
+        if quote_sources:
+            source_text = "；".join(dict.fromkeys(quote_sources))
+            source_part = TextPart(
+                text=f"\n[引用图片来源：{source_text}。图片属于被引用消息中的原发送者，不是当前发言者。]"
+            )
+            req.extra_user_content_parts.insert(0, source_part)
+
         # 对引用图片统一计算路径：无论描述来自缓存还是本次现算，
         # 默认都从聊天模型请求中移除原图，只注入描述。
         quote_paths = []
@@ -804,7 +821,7 @@ class SysSettingPortPlugin(Star):
             req.image_urls = [path for path in req.image_urls if path not in quote_paths]
             image_urls = [path for path in image_urls if path not in quote_paths]
 
-        if quote_captions:
+        if quote_captions and not wants_original_image:
             source_text = "；".join(dict.fromkeys(quote_sources)) or "原发送者"
             captions_text = "；".join(quote_captions)
             req.extra_user_content_parts.append(
