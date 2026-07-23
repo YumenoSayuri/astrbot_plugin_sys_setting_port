@@ -1,6 +1,8 @@
 import asyncio
 import copy
+import datetime
 import time
+from collections import OrderedDict, defaultdict
 from sys import maxsize
 
 from astrbot.api.all import *
@@ -14,7 +16,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "1.2.0", "系统设置移植 - 多模态转述控制与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.0.0", "系统设置移植 - 群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -28,6 +30,10 @@ class SysSettingPortPlugin(Star):
         os.makedirs(data_dir, exist_ok=True)
         self.data_file = os.path.join(data_dir, "proactive_data.json")
         self.last_chat_records = self._load_data()
+        self.group_visual_history = defaultdict(list)
+        self.group_visual_locks = defaultdict(asyncio.Lock)
+        self.image_caption_cache = OrderedDict()
+        self.message_image_cache = OrderedDict()
         self.proactive_monitor_task = asyncio.create_task(self._proactive_monitor_loop())
 
     def _load_data(self):
@@ -56,6 +62,180 @@ class SysSettingPortPlugin(Star):
         # 彻底解决重载报错：不再调用 super().terminate()，因为基类的 terminate 可能是同步的，
         # 强行 await 会导致 TypeError: object NoneType can't be used in 'await' expression。
         # 只要我们清理了自己的任务，插件就能安全退出。
+
+    # ==================== 群聊视觉上下文 ====================
+    def _visual_group_enabled(self, event: AstrMessageEvent) -> bool:
+        if not self.config.get("enable_group_visual_context", False):
+            return False
+        group_id = str(event.get_group_id() or "")
+        allowed_groups = {
+            str(item).strip()
+            for item in self.config.get("group_visual_allowed_groups", [])
+            if str(item).strip()
+        }
+        return bool(group_id and group_id in allowed_groups)
+
+    @staticmethod
+    def _image_cache_key(image: Image) -> str:
+        return str(
+            getattr(image, "url", None)
+            or getattr(image, "file", None)
+            or id(image)
+        )
+
+    def _purge_expired_caption_cache(self):
+        ttl_seconds = max(
+            60,
+            int(self.config.get("group_visual_cache_ttl_hours", 6)) * 3600,
+        )
+        expire_before = time.time() - ttl_seconds
+        for cache in (self.image_caption_cache, self.message_image_cache):
+            expired_keys = [
+                key
+                for key, value in cache.items()
+                if value.get("cached_at", 0) < expire_before
+            ]
+            for key in expired_keys:
+                cache.pop(key, None)
+
+    def _cache_put(self, cache: OrderedDict, key: str, value: dict, limit: int):
+        if not key:
+            return
+        self._purge_expired_caption_cache()
+        cache.pop(key, None)
+        value["cached_at"] = time.time()
+        cache[key] = value
+        while len(cache) > max(1, limit):
+            cache.popitem(last=False)
+
+    async def _caption_group_image(self, image: Image) -> str:
+        self._purge_expired_caption_cache()
+        cache_key = self._image_cache_key(image)
+        cached = self.image_caption_cache.get(cache_key)
+        if cached:
+            self.image_caption_cache.move_to_end(cache_key)
+            return cached["caption"]
+
+        provider_id = self.config.get("group_visual_provider_id", "")
+        if not provider_id:
+            return ""
+
+        prompt = self.config.get(
+            "group_visual_prompt",
+            "请用简洁准确的中文描述图片中的主体、动作、场景、文字和重要细节，供群聊上下文理解。只输出图片描述。",
+        )
+        max_retries = max(1, int(self.config.get("max_retries", 3)))
+        retry_keywords = self.config.get(
+            "retry_keywords",
+            ["抱歉", "对不起", "无法", "sorry", "apologize", "error", "失败", "不能"],
+        )
+        try:
+            path = await image.convert_to_file_path()
+            caption = await self._try_caption(
+                provider_id,
+                prompt,
+                [path],
+                max_retries,
+                retry_keywords,
+            )
+            if caption:
+                cache_limit = int(self.config.get("group_visual_cache_size", 300))
+                self._cache_put(
+                    self.image_caption_cache,
+                    cache_key,
+                    {"caption": caption},
+                    cache_limit,
+                )
+            return caption
+        except Exception as e:
+            logger.error(f"群聊图片理解失败: {e}")
+            return ""
+
+    async def _build_group_history_message(self, event: AstrMessageEvent):
+        parts = []
+        captions = []
+        images = []
+        for comp in event.get_messages():
+            if isinstance(comp, Plain):
+                if comp.text:
+                    parts.append(comp.text)
+            elif isinstance(comp, Image):
+                caption = await self._caption_group_image(comp)
+                parts.append(f"[图片：{caption}]" if caption else "[图片：理解失败]")
+                captions.append(caption)
+                images.append(comp)
+            elif isinstance(comp, At):
+                target = comp.name or comp.qq
+                parts.append(f"[At:{target}]")
+            elif isinstance(comp, Reply):
+                sender = comp.sender_nickname or comp.sender_id or "未知用户"
+                quoted_text = (comp.message_str or "").strip()
+                if quoted_text:
+                    parts.append(f"[引用 {sender}：{quoted_text}]")
+                else:
+                    parts.append(f"[引用 {sender} 的消息]")
+
+        content = " ".join(part.strip() for part in parts if part and part.strip())
+        if not content:
+            return None, captions, images
+
+        sender_name = event.get_sender_name() or str(event.get_sender_id())
+        sender_id = str(event.get_sender_id())
+        timestamp = getattr(event.message_obj, "timestamp", None)
+        try:
+            time_text = datetime.datetime.fromtimestamp(int(timestamp)).strftime("%H:%M:%S")
+        except (TypeError, ValueError, OSError):
+            time_text = datetime.datetime.now().strftime("%H:%M:%S")
+        record = f"[{sender_name}（{sender_id}）/{time_text}]: {content}"
+        return record, captions, images
+
+    def _get_group_visual_history_text(self, group_id: str, current_message_id: str = "") -> str:
+        history = self.group_visual_history.get(group_id, [])
+        records = [
+            item["record"]
+            for item in history
+            if not current_message_id or item.get("message_id") != current_message_id
+        ]
+        return "\n---\n".join(records)
+
+    @event_message_type(EventMessageType.GROUP_MESSAGE, priority=maxsize - 1)
+    async def handle_group_visual_context(self, event: AstrMessageEvent):
+        if not self._visual_group_enabled(event):
+            return
+        if str(event.get_sender_id()) == str(event.get_self_id()):
+            return
+
+        group_id = str(event.get_group_id())
+        async with self.group_visual_locks[group_id]:
+            record, captions, images = await self._build_group_history_message(event)
+            if not record:
+                return
+
+            history = self.group_visual_history[group_id]
+            history.append({
+                "message_id": str(event.message_obj.message_id or ""),
+                "record": record,
+            })
+            max_messages = max(
+                1,
+                int(self.config.get("group_visual_max_messages", 80)),
+            )
+            if len(history) > max_messages:
+                del history[:-max_messages]
+
+            message_id = str(event.message_obj.message_id or "")
+            if message_id and images:
+                cache_limit = int(self.config.get("group_visual_cache_size", 300))
+                self._cache_put(
+                    self.message_image_cache,
+                    message_id,
+                    {
+                        "captions": captions,
+                        "sender_name": event.get_sender_name() or str(event.get_sender_id()),
+                        "sender_id": str(event.get_sender_id()),
+                    },
+                    cache_limit,
+                )
 
     # ==================== 主动回复机制 ====================
     def _is_dnd_time(self, dnd_str: str) -> bool:
@@ -441,11 +621,10 @@ class SysSettingPortPlugin(Star):
 
     @event_message_type(EventMessageType.ALL, priority=maxsize - 3)
     async def handle_strip_quote_image(self, event: AstrMessageEvent):
-        """【移花接木】将引用消息中的图片提取到主消息体中。
-        既能绕过底层强行调用当前 LLM 进行引用转述的硬编码逻辑，
-        又能让其他插件（如图生图）和多模态 LLM 正常获取到图片。"""
+        """将引用图片移到主消息链，避免 AstrBot 底层重复转述并兼容取图插件。"""
         quote_images = []
         quote_sources = []
+        quote_captions = []
         for comp in event.message_obj.message:
             if isinstance(comp, Reply) and comp.chain:
                 sender_name = (getattr(comp, "sender_nickname", None) or "未知用户").strip()
@@ -453,6 +632,15 @@ class SysSettingPortPlugin(Star):
                 source_label = sender_name
                 if sender_id and str(sender_id) not in source_label:
                     source_label = f"{source_label}（{sender_id}）"
+
+                cached = self.message_image_cache.get(str(comp.id))
+                if cached:
+                    self._purge_expired_caption_cache()
+                    cached = self.message_image_cache.get(str(comp.id))
+                if cached:
+                    quote_captions.extend(
+                        caption for caption in cached.get("captions", []) if caption
+                    )
 
                 new_chain = []
                 for c in comp.chain:
@@ -462,15 +650,13 @@ class SysSettingPortPlugin(Star):
                     else:
                         new_chain.append(c)
                 comp.chain = new_chain
-        
+
         if quote_images:
-            # 将提取出的图片追加到当前消息末尾，伪装成普通图片附件
             for img in quote_images:
                 event.message_obj.message.append(img)
-            event.set_extra(
-                "sys_setting_port_quote_sources",
-                quote_sources,
-            )
+            event.set_extra("sys_setting_port_quote_images", quote_images)
+            event.set_extra("sys_setting_port_quote_sources", quote_sources)
+            event.set_extra("sys_setting_port_quote_captions", quote_captions)
 
     # ==================== 多模态转述机制 ====================
     async def _try_caption(self, provider_id: str, prompt: str, image_urls: list, max_retries: int, retry_keywords: list) -> str:
@@ -512,8 +698,31 @@ class SysSettingPortPlugin(Star):
         logger.error(f"{provider_id} 经过 {max_retries} 次尝试后仍然失败。")
         return ""
 
-    @on_llm_request()
+    @on_llm_request(priority=maxsize)
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
+        # === 群聊视觉上下文注入 ===
+        if self._visual_group_enabled(event):
+            group_id = str(event.get_group_id())
+            history_text = self._get_group_visual_history_text(
+                group_id,
+                str(event.message_obj.message_id or ""),
+            )
+            if history_text:
+                # 作为一次性的普通 user 上下文插入正式历史之后、当前唤醒消息之前。
+                # 不写入 conversation.history，也不会在下一轮重复累计。
+                req.contexts.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "<group_chat_context>\n"
+                            "以下是该群最近的真实聊天时间线。图片描述位于原图片消息的位置；"
+                            "请依据发送者、时间、At 与引用关系判断对话对象，不要默认所有消息都在对你说。\n"
+                            f"{history_text}\n"
+                            "</group_chat_context>"
+                        ),
+                    }
+                )
+
         # === 多模态转述逻辑 ===
         caption_provider_id = self.config.get("caption_provider_id", "")
         fallback_provider_id = self.config.get("fallback_provider_id", "")
@@ -548,8 +757,15 @@ class SysSettingPortPlugin(Star):
         # 更新 req.image_urls，确保多模态模型能看到所有图片
         req.image_urls = image_urls
 
-        # 图片已从 Reply 中移到主消息链，补充原引用发送者，避免模型误以为图片由当前用户发送。
         quote_sources = event.get_extra("sys_setting_port_quote_sources", [])
+        quote_captions = event.get_extra("sys_setting_port_quote_captions", [])
+        quote_images = event.get_extra("sys_setting_port_quote_images", [])
+        if quote_images and not quote_captions and self.config.get("group_visual_provider_id"):
+            quote_captions = []
+            for image in quote_images:
+                caption = await self._caption_group_image(image)
+                if caption:
+                    quote_captions.append(caption)
         if quote_sources:
             source_text = "；".join(dict.fromkeys(quote_sources))
             source_part = TextPart(
@@ -557,12 +773,54 @@ class SysSettingPortPlugin(Star):
             )
             req.extra_user_content_parts.insert(0, source_part)
 
+        # 引用默认只复用描述；多模态模型只有命中关键词时才重新接收原图。
+        is_target_text_model = bool(
+            model_name
+            and any(target.lower() in model_name.lower() for target in target_models)
+        )
+        inspect_keywords = self.config.get(
+            "quote_image_inspect_keywords",
+            ["仔细看", "看原图", "看细节", "重新看", "重看", "再看"],
+        )
+        wants_original_image = (
+            bool(quote_images)
+            and not is_target_text_model
+            and any(
+                keyword and keyword in (req.prompt or "")
+                for keyword in inspect_keywords
+            )
+        )
+
+        # 对引用图片统一计算路径：无论描述来自缓存还是本次现算，
+        # 默认都从聊天模型请求中移除原图，只注入描述。
+        quote_paths = []
+        for image in quote_images:
+            try:
+                quote_paths.append(await image.convert_to_file_path())
+            except Exception as e:
+                logger.warning(f"获取引用图片路径失败: {e}")
+
+        if quote_images and not wants_original_image:
+            req.image_urls = [path for path in req.image_urls if path not in quote_paths]
+            image_urls = [path for path in image_urls if path not in quote_paths]
+
+        if quote_captions:
+            source_text = "；".join(dict.fromkeys(quote_sources)) or "原发送者"
+            captions_text = "；".join(quote_captions)
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text=f"\n[被引用图片的既有描述（来自 {source_text}）]: {captions_text}"
+                )
+            )
+            if not image_urls and not wants_original_image:
+                return
+
         # 如果当前模型不在目标列表中，说明它是多模态模型，直接返回，让它自己看图
         if not model_name:
             return
             
         # 模糊匹配：只要 target_models 中的某个字符串是当前模型名称的子串，就触发
-        is_match = any(target.lower() in model_name.lower() for target in target_models)
+        is_match = is_target_text_model
         if not is_match:
             return
 

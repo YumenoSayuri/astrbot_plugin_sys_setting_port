@@ -1,5 +1,5 @@
 name: astrbot_plugin_sys_setting_port
 author: Nova
-version: 1.8.0
-description: 系统设置移植 - 多模态转述控制(带重试与兜底)与自定义等待机制。精准拦截纯文本模型请求，调用多模态模型进行图片转述（支持模型名称模糊匹配）。支持严格用户隔离的艾特待回、超时主动唤醒，以及具备智能判定、免打扰、随机调度和硬盘级持久化的高级私聊主动回复功能。
+version: 2.0.0
+description: 系统设置移植 - 群聊视觉上下文、多模态转述控制与自定义等待机制。支持白名单群的完整群聊时间线、图片原位描述、引用描述复用、纯文本模型转述及私聊主动回复。
 repo: https://github.com/YumenoSayuri/astrbot_plugin_sys_setting_port
