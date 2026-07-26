@@ -16,7 +16,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.1.2", "系统设置移植 - 群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.1.3", "系统设置移植 - 群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -383,6 +383,48 @@ class SysSettingPortPlugin(Star):
             event.set_extra("sys_setting_port_quote_sources", quote_sources)
             event.set_extra("sys_setting_port_quote_captions", quote_captions)
 
+    @staticmethod
+    def _match_target_model(req: ProviderRequest, provider, target_models: list) -> tuple[bool, str, list[str]]:
+        candidates = []
+        provider_config = getattr(provider, "provider_config", {}) or {}
+        raw_candidates = [
+            getattr(req, "model", None),
+            provider.get_model() if provider and hasattr(provider, "get_model") else None,
+            provider_config.get("model"),
+            provider_config.get("id"),
+        ]
+        if provider and hasattr(provider, "meta"):
+            try:
+                meta = provider.meta()
+                raw_candidates.extend([getattr(meta, "model", None), getattr(meta, "id", None)])
+            except Exception:
+                pass
+        for value in raw_candidates:
+            text = str(value or "").strip()
+            if text and text.lower() not in {item.lower() for item in candidates}:
+                candidates.append(text)
+
+        keywords = [str(item).strip() for item in target_models or [] if str(item).strip()]
+        for keyword in keywords:
+            if any(keyword.lower() in candidate.lower() for candidate in candidates):
+                return True, keyword, candidates
+        return False, "", candidates
+
+    @staticmethod
+    def _provider_log_name(provider_id: str, provider) -> str:
+        model = provider.get_model() if provider and hasattr(provider, "get_model") else ""
+        return f"{provider_id} ({model})" if model else provider_id
+
+    @staticmethod
+    def _inject_caption_text(event: AstrMessageEvent, req: ProviderRequest, caption_text: str) -> str:
+        if event.is_private_chat():
+            if req.extra_user_content_parts is None:
+                req.extra_user_content_parts = []
+            req.extra_user_content_parts.append(TextPart(text=f"\n{caption_text}"))
+            return "private_persistent_user_content"
+        req.system_prompt = f"{req.system_prompt or ''}\n{caption_text}\n"
+        return "group_temporary_system_prompt"
+
     async def _try_caption(self, provider_id: str, prompt: str, image_urls: list, max_retries: int) -> str:
         prov = self.context.get_provider_by_id(provider_id)
         if not prov: return ""
@@ -410,33 +452,36 @@ class SysSettingPortPlugin(Star):
         return ""
 
     @on_llm_request(priority=-maxsize)
-    async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
-        if self._group_context_enabled(event):
-            group_id = str(event.get_group_id())
-            history_text = self._get_group_visual_history_text(group_id, str(event.message_obj.message_id or ""))
-            if history_text:
-                injection_mode = self._inject_group_chat_context(req, history_text)
-                context_position = next(
-                    (
-                        index
-                        for index, message in enumerate(req.contexts or [])
-                        if "<group_chat_context>"
-                        in str(message.content if isinstance(message, Message) else message.get("content", ""))
-                    ),
-                    -1,
-                )
-                logger.info(
-                    f"群聊上下文已最终注入: group={group_id}, mode={injection_mode}, "
-                    f"position={context_position}, records={history_text.count(chr(10) + '---' + chr(10)) + 1}, "
-                    f"chars={len(history_text)}"
-                )
-            else:
-                logger.debug(f"群聊上下文无可注入历史: group={group_id}")
+    async def inject_group_context_finally(self, event: AstrMessageEvent, req: ProviderRequest):
+        if not self._group_context_enabled(event):
+            return
+        group_id = str(event.get_group_id())
+        history_text = self._get_group_visual_history_text(group_id, str(event.message_obj.message_id or ""))
+        if not history_text:
+            logger.debug(f"群聊上下文无可注入历史: group={group_id}")
+            return
+        injection_mode = self._inject_group_chat_context(req, history_text)
+        context_position = next(
+            (
+                index
+                for index, message in enumerate(req.contexts or [])
+                if "<group_chat_context>"
+                in str(message.content if isinstance(message, Message) else message.get("content", ""))
+            ),
+            -1,
+        )
+        logger.info(
+            f"群聊上下文已最终注入: group={group_id}, mode={injection_mode}, "
+            f"position={context_position}, records={history_text.count(chr(10) + '---' + chr(10)) + 1}, "
+            f"chars={len(history_text)}"
+        )
 
+    @on_llm_request()
+    async def on_image_caption_req(self, event: AstrMessageEvent, req: ProviderRequest):
         caption_provider_id, fallback_provider_id, target_models = self.config.get("caption_provider_id", ""), self.config.get("fallback_provider_id", ""), self.config.get("target_models", [])
         caption_prompt, max_retries = self.config.get("caption_prompt", "请详细描述这张图片的内容，以便纯文本模型能够理解。"), int(self.config.get("max_retries", 3))
         curr_prov = self.context.get_using_provider(event.unified_msg_origin)
-        model_name = req.model or (curr_prov.get_model() if curr_prov and hasattr(curr_prov, "get_model") else getattr(getattr(curr_prov, "provider_meta", None), "model", None))
+        is_target_text_model, matched_keyword, model_candidates = self._match_target_model(req, curr_prov, target_models)
         image_urls = list(req.image_urls) if req.image_urls else []
         for comp in event.message_obj.message:
             if isinstance(comp, Image):
@@ -445,7 +490,6 @@ class SysSettingPortPlugin(Star):
         if not image_urls: return
         req.image_urls = image_urls
         quote_sources, quote_captions, quote_images = event.get_extra("sys_setting_port_quote_sources", []), event.get_extra("sys_setting_port_quote_captions", []), event.get_extra("sys_setting_port_quote_images", [])
-        is_target_text_model = bool(model_name and any(t.lower() in model_name.lower() for t in target_models))
         inspect_keywords = self.config.get("quote_image_inspect_keywords", ["仔细看", "看原图", "看细节", "重新看", "重看", "再看"])
         wants_original = bool(quote_images) and not is_target_text_model and any(k and k in (req.prompt or "") for k in inspect_keywords)
         if quote_images and not quote_captions and not wants_original and self._visual_group_enabled(event) and self.config.get("group_visual_provider_id"):
@@ -453,9 +497,9 @@ class SysSettingPortPlugin(Star):
                 caption = await self._caption_group_image(image)
                 if caption: quote_captions.append(caption)
         
-        if quote_sources:
-            req.system_prompt += f"\n[系统附加信息 - 引用图片来源：{'；'.join(dict.fromkeys(quote_sources))}。图片属于被引用消息中的原发送者，不是当前发言者。]\n"
-        
+        if quote_sources and not event.is_private_chat():
+            req.system_prompt = (req.system_prompt or "") + f"\n[系统附加信息 - 引用图片来源：{'；'.join(dict.fromkeys(quote_sources))}。图片属于被引用消息中的原发送者，不是当前发言者。]\n"
+
         quote_paths = []
         for image in quote_images:
             try: quote_paths.append(await image.convert_to_file_path())
@@ -464,15 +508,62 @@ class SysSettingPortPlugin(Star):
             req.image_urls = [p for p in req.image_urls if p not in quote_paths]
             image_urls = [p for p in image_urls if p not in quote_paths]
         if quote_captions and not wants_original:
-            req.system_prompt += f"\n[系统附加信息 - 被引用图片的既有描述（来自 {'；'.join(dict.fromkeys(quote_sources)) or '原发送者'}）]: {'；'.join(quote_captions)}\n"
-            if not image_urls: return
-        if not model_name or not is_target_text_model: return
+            cached_caption_text = (
+                f"[被引用图片的既有描述（来自 {'；'.join(dict.fromkeys(quote_sources)) or '原发送者'}）]: "
+                f"{'；'.join(quote_captions)}"
+            )
+            cached_injection_mode = self._inject_caption_text(event, req, cached_caption_text)
+            logger.info(
+                f"【图片转述｜成功】provider=群聊图片描述缓存, mode={cached_injection_mode}, "
+                f"chars={len('；'.join(quote_captions))}, images={len(quote_images)}"
+            )
+            if not image_urls:
+                return
+        if not is_target_text_model:
+            logger.debug(
+                f"【图片转述｜未触发】未匹配纯文本模型关键词；candidates={model_candidates}, "
+                f"keywords={[str(item).strip() for item in target_models or []]}"
+            )
+            return
         req.image_urls = []
-        if not caption_provider_id: return
+        if not caption_provider_id:
+            logger.warning(
+                f"【图片转述｜失败】已匹配关键词 {matched_keyword}，但未配置多模态转述模型；"
+                f"candidates={model_candidates}"
+            )
+            return
+
+        caption_provider = self.context.get_provider_by_id(caption_provider_id)
+        logger.info(
+            f"【图片转述｜触发】目标关键词={matched_keyword}, current_models={model_candidates}, "
+            f"caption_provider={self._provider_log_name(caption_provider_id, caption_provider)}, images={len(image_urls)}"
+        )
         caption = await self._try_caption(caption_provider_id, caption_prompt, image_urls, max_retries)
-        if not caption and fallback_provider_id: caption = await self._try_caption(fallback_provider_id, caption_prompt, image_urls, max_retries)
-        if caption:
-            caption_source = f"（图片来自被引用消息的 {'；'.join(dict.fromkeys(quote_sources))}，不是当前发言者）" if quote_sources else ""
-            req.system_prompt += f"\n[系统附加信息 - 图片转述内容]{caption_source}: {caption}\n"
-            # 清理底层可能已经添加的图片路径提示文本
-            req.extra_user_content_parts = [p for p in req.extra_user_content_parts if not (isinstance(p, TextPart) and "[Image Attachment: path" in p.text)]
+        used_provider_id = caption_provider_id
+        used_provider = caption_provider
+        if not caption and fallback_provider_id:
+            fallback_provider = self.context.get_provider_by_id(fallback_provider_id)
+            logger.warning(
+                f"【图片转述｜主模型失败】准备调用兜底模型 "
+                f"{self._provider_log_name(fallback_provider_id, fallback_provider)}"
+            )
+            caption = await self._try_caption(fallback_provider_id, caption_prompt, image_urls, max_retries)
+            used_provider_id = fallback_provider_id
+            used_provider = fallback_provider
+        if not caption:
+            logger.error(
+                f"【图片转述｜失败】所有转述模型均未返回有效描述；target={matched_keyword}, images={len(image_urls)}"
+            )
+            return
+
+        req.extra_user_content_parts = [
+            part for part in (req.extra_user_content_parts or [])
+            if not (isinstance(part, TextPart) and "[Image Attachment: path" in part.text)
+        ]
+        caption_source = f"（图片来自被引用消息的 {'；'.join(dict.fromkeys(quote_sources))}，不是当前发言者）" if quote_sources else ""
+        caption_text = f"[图片转述内容]{caption_source}: {caption}"
+        injection_mode = self._inject_caption_text(event, req, caption_text)
+        logger.info(
+            f"【图片转述｜成功】provider={self._provider_log_name(used_provider_id, used_provider)}, "
+            f"mode={injection_mode}, chars={len(caption)}, images={len(image_urls)}"
+        )
