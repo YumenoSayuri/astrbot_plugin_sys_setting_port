@@ -1,5 +1,5 @@
 name: astrbot_plugin_sys_setting_port
 author: Nova
-version: 2.1.3
-description: 系统设置移植 - 群聊视觉上下文、多模态转述控制与自定义等待机制。支持不写入会话历史的临时群聊时间线注入、智能转述判定官、图片原位描述、引用描述复用、纯文本模型转述及私聊主动回复。
+version: 2.2.0
+description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。群消息不常驻内存，静默图片描述持久化到 SQLite 并按群限制容量。
 repo: https://github.com/YumenoSayuri/astrbot_plugin_sys_setting_port

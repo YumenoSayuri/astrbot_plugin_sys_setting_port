@@ -1,9 +1,11 @@
 import asyncio
 import copy
 import datetime
+import os
 import time
-from collections import OrderedDict, defaultdict
 from sys import maxsize
+
+import aiosqlite
 
 from astrbot.api.all import *
 from astrbot.core.message.components import Image, Reply, At, Plain
@@ -16,22 +18,22 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.1.3", "系统设置移植 - 群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.0", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
         
-        import os
         import json
         data_dir = os.path.join(os.getcwd(), "data", "plugin_data", "astrbot_plugin_sys_setting_port")
         os.makedirs(data_dir, exist_ok=True)
         self.data_file = os.path.join(data_dir, "proactive_data.json")
+        self.caption_db_path = os.path.join(data_dir, "group_image_captions.db")
+        self.caption_db_ready = False
+        self.caption_db_lock = asyncio.Lock()
         self.last_chat_records = self._load_data()
-        self.group_visual_history = defaultdict(list)
-        self.group_visual_locks = defaultdict(asyncio.Lock)
-        self.image_caption_cache = OrderedDict()
-        self.message_image_cache = OrderedDict()
+        self.request_watchdogs = {}
+        self.request_watchdog_sequence = 0
         self.proactive_monitor_task = asyncio.create_task(self._proactive_monitor_loop())
 
     def _load_data(self):
@@ -56,6 +58,117 @@ class SysSettingPortPlugin(Star):
     async def terminate(self):
         if self.proactive_monitor_task:
             self.proactive_monitor_task.cancel()
+        for entry in list(self.request_watchdogs.values()):
+            watchdog_task = entry.get("watchdog_task")
+            if watchdog_task and not watchdog_task.done():
+                watchdog_task.cancel()
+        self.request_watchdogs.clear()
+
+    def _finish_request_watchdog(self, session_id: str, token: int):
+        entry = self.request_watchdogs.get(session_id)
+        if not entry or entry.get("token") != token:
+            return
+        self.request_watchdogs.pop(session_id, None)
+        watchdog_task = entry.get("watchdog_task")
+        if not entry.get("timed_out") and watchdog_task and not watchdog_task.done():
+            watchdog_task.cancel()
+
+    async def _request_timeout_watchdog(
+        self,
+        event: AstrMessageEvent,
+        session_id: str,
+        token: int,
+        pipeline_task: asyncio.Task,
+        timeout_seconds: int,
+    ):
+        try:
+            await asyncio.sleep(timeout_seconds)
+            entry = self.request_watchdogs.get(session_id)
+            if (
+                not entry
+                or entry.get("token") != token
+                or entry.get("pipeline_task") is not pipeline_task
+                or pipeline_task.done()
+            ):
+                return
+
+            entry["timed_out"] = True
+            elapsed = time.monotonic() - entry["started_at"]
+            logger.error(
+                f"【会话请求超时｜强制终止】session={session_id}, token={token}, "
+                f"limit={timeout_seconds}s, elapsed={elapsed:.1f}s；正在取消当前请求并释放会话锁"
+            )
+            event.set_extra("sys_setting_port_request_timed_out", True)
+            pipeline_task.cancel()
+
+            if self.config.get("request_timeout_send_notice", True):
+                notice = str(
+                    self.config.get(
+                        "request_timeout_notice_text",
+                        "这次请求处理超时，已强制结束。后续消息现在可以继续处理。",
+                    )
+                ).strip()
+                if notice:
+                    try:
+                        await asyncio.wait_for(
+                            event.send(event.plain_result(notice)),
+                            timeout=15,
+                        )
+                    except Exception as e:
+                        logger.warning(f"会话请求超时提示发送失败: {e}")
+        except asyncio.CancelledError:
+            return
+
+    @on_llm_request(priority=maxsize)
+    async def register_request_timeout_watchdog(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ):
+        if not self.config.get("enable_request_timeout_watchdog", True):
+            return
+        timeout_seconds = max(
+            1,
+            int(self.config.get("request_timeout_seconds", 180)),
+        )
+        pipeline_task = asyncio.current_task()
+        if pipeline_task is None:
+            logger.warning("无法获取当前 pipeline task，会话请求超时看门狗未启动")
+            return
+
+        session_id = event.unified_msg_origin
+        old_entry = self.request_watchdogs.pop(session_id, None)
+        if old_entry:
+            old_watchdog = old_entry.get("watchdog_task")
+            if old_watchdog and not old_watchdog.done():
+                old_watchdog.cancel()
+
+        self.request_watchdog_sequence += 1
+        token = self.request_watchdog_sequence
+        entry = {
+            "token": token,
+            "pipeline_task": pipeline_task,
+            "watchdog_task": None,
+            "started_at": time.monotonic(),
+            "timed_out": False,
+        }
+        self.request_watchdogs[session_id] = entry
+        watchdog_task = asyncio.create_task(
+            self._request_timeout_watchdog(
+                event,
+                session_id,
+                token,
+                pipeline_task,
+                timeout_seconds,
+            )
+        )
+        entry["watchdog_task"] = watchdog_task
+        pipeline_task.add_done_callback(
+            lambda _task, sid=session_id, tok=token: self._finish_request_watchdog(sid, tok)
+        )
+        logger.info(
+            f"【会话请求看门狗｜已启动】session={session_id}, token={token}, limit={timeout_seconds}s"
+        )
 
     def _group_context_enabled(self, event: AstrMessageEvent) -> bool:
         return bool(self.config.get("enable_group_visual_context", False) and event.get_group_id())
@@ -64,94 +177,247 @@ class SysSettingPortPlugin(Star):
         if not self._group_context_enabled(event):
             return False
         group_id = str(event.get_group_id())
-        allowed_groups = {str(item).strip() for item in self.config.get("group_visual_allowed_groups", []) if str(item).strip()}
+        allowed_groups = {
+            str(item).strip()
+            for item in self.config.get("group_visual_allowed_groups", [])
+            if str(item).strip()
+        }
         return group_id in allowed_groups
 
     @staticmethod
-    def _image_cache_key(image: Image) -> str:
-        return str(getattr(image, "url", None) or getattr(image, "file", None) or id(image))
+    def _group_cache_session_id(event: AstrMessageEvent) -> str:
+        return str(event.get_group_id() or event.unified_msg_origin)
 
-    def _purge_expired_caption_cache(self):
-        ttl_seconds = max(60, int(self.config.get("group_visual_cache_ttl_hours", 6)) * 3600)
-        expire_before = time.time() - ttl_seconds
-        for cache in (self.image_caption_cache, self.message_image_cache):
-            expired_keys = [key for key, value in cache.items() if value.get("cached_at", 0) < expire_before]
-            for key in expired_keys:
-                cache.pop(key, None)
+    async def _ensure_caption_db(self):
+        if self.caption_db_ready:
+            return
+        async with self.caption_db_lock:
+            if self.caption_db_ready:
+                return
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA busy_timeout=10000")
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS group_image_captions (
+                        session_id TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        image_key TEXT NOT NULL,
+                        caption TEXT NOT NULL,
+                        sender_name TEXT NOT NULL DEFAULT '',
+                        sender_id TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY (session_id, message_id, image_key)
+                    )
+                    """
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_group_image_session_time "
+                    "ON group_image_captions(session_id, created_at DESC)"
+                )
+                await db.commit()
+            self.caption_db_ready = True
 
-    def _cache_put(self, cache: OrderedDict, key: str, value: dict, limit: int):
-        if not key: return
-        self._purge_expired_caption_cache()
-        cache.pop(key, None)
-        value["cached_at"] = time.time()
-        cache[key] = value
-        while len(cache) > max(1, limit):
-            cache.popitem(last=False)
+    def _caption_cache_ttl_seconds(self) -> int:
+        hours = max(0, int(self.config.get("group_visual_cache_ttl_hours", 8)))
+        return hours * 3600
+
+    async def _get_captions_by_message_ids(
+        self,
+        session_id: str,
+        message_ids: list[str],
+    ) -> dict[str, list[str]]:
+        unique_ids = list(dict.fromkeys(str(item) for item in message_ids if str(item)))
+        if not session_id or not unique_ids:
+            return {}
+        await self._ensure_caption_db()
+        ttl_seconds = self._caption_cache_ttl_seconds()
+        placeholders = ",".join("?" for _ in unique_ids)
+        query = (
+            "SELECT message_id, caption FROM group_image_captions "
+            f"WHERE session_id = ? AND message_id IN ({placeholders})"
+        )
+        params = [session_id, *unique_ids]
+        if ttl_seconds > 0:
+            query += " AND created_at >= ?"
+            params.append(time.time() - ttl_seconds)
+        query += " ORDER BY created_at ASC, rowid ASC"
+        result = {}
+        async with aiosqlite.connect(self.caption_db_path) as db:
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+        for message_id, caption in rows:
+            if caption:
+                result.setdefault(str(message_id), []).append(str(caption))
+        return result
+
+    async def _get_message_captions(self, session_id: str, message_id: str) -> list[str]:
+        result = await self._get_captions_by_message_ids(session_id, [message_id])
+        return result.get(str(message_id), [])
+
+    async def _save_message_captions(
+        self,
+        session_id: str,
+        message_id: str,
+        captions: list[tuple[str, str]],
+        sender_name: str,
+        sender_id: str,
+    ):
+        valid = [(str(key), str(caption).strip()) for key, caption in captions if str(caption).strip()]
+        if not session_id or not message_id or not valid:
+            return
+        await self._ensure_caption_db()
+        now = time.time()
+        per_session_limit = max(1, int(self.config.get("group_visual_cache_size", 100)))
+        ttl_seconds = self._caption_cache_ttl_seconds()
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                await db.execute("PRAGMA busy_timeout=10000")
+                await db.executemany(
+                    """
+                    INSERT INTO group_image_captions
+                    (session_id, message_id, image_key, caption, sender_name, sender_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, message_id, image_key) DO UPDATE SET
+                        caption=excluded.caption,
+                        sender_name=excluded.sender_name,
+                        sender_id=excluded.sender_id,
+                        created_at=excluded.created_at
+                    """,
+                    [
+                        (session_id, message_id, key, caption, sender_name, sender_id, now)
+                        for key, caption in valid
+                    ],
+                )
+                if ttl_seconds > 0:
+                    await db.execute(
+                        "DELETE FROM group_image_captions WHERE session_id = ? AND created_at < ?",
+                        (session_id, now - ttl_seconds),
+                    )
+                await db.execute(
+                    """
+                    DELETE FROM group_image_captions
+                    WHERE session_id = ? AND message_id NOT IN (
+                        SELECT message_id FROM group_image_captions
+                        WHERE session_id = ?
+                        GROUP BY message_id
+                        ORDER BY MAX(created_at) DESC
+                        LIMIT ?
+                    )
+                    """,
+                    (session_id, session_id, per_session_limit),
+                )
+                await db.commit()
+
+    @staticmethod
+    def _image_cache_key(image: Image, index: int = 0) -> str:
+        return str(
+            getattr(image, "url", None)
+            or getattr(image, "file", None)
+            or f"image_{index}"
+        )
 
     async def _caption_group_image(self, image: Image) -> str:
-        self._purge_expired_caption_cache()
-        cache_key = self._image_cache_key(image)
-        cached = self.image_caption_cache.get(cache_key)
-        if cached:
-            self.image_caption_cache.move_to_end(cache_key)
-            return cached["caption"]
-
         provider_id = self.config.get("group_visual_provider_id", "")
-        if not provider_id: return ""
-
-        prompt = self.config.get("group_visual_prompt", "请用简洁准确的中文描述图片中的主体、动作、场景、文字和重要细节，供群聊上下文理解。只输出图片描述。")
+        if not provider_id:
+            return ""
+        prompt = self.config.get(
+            "group_visual_prompt",
+            "请用简洁准确的中文描述图片中的主体、动作、场景、文字和重要细节，供群聊上下文理解。只输出图片描述。",
+        )
         max_retries = max(1, int(self.config.get("max_retries", 3)))
         try:
             path = await image.convert_to_file_path()
-            caption = await self._try_caption(provider_id, prompt, [path], max_retries)
-            if caption:
-                cache_limit = int(self.config.get("group_visual_cache_size", 300))
-                self._cache_put(self.image_caption_cache, cache_key, {"caption": caption}, cache_limit)
-            return caption
+            return await self._try_caption(provider_id, prompt, [path], max_retries)
         except Exception as e:
             logger.error(f"群聊图片理解失败: {e}")
             return ""
 
-    async def _build_group_history_message(self, event: AstrMessageEvent):
+    @staticmethod
+    def _format_onebot_history_message(msg: dict, captions: list[str]) -> str:
+        sender = msg.get("sender", {}) or {}
+        sender_name = sender.get("card") or sender.get("nickname") or "未知用户"
+        sender_id = str(sender.get("user_id", ""))
+        try:
+            time_text = datetime.datetime.fromtimestamp(int(msg.get("time", 0))).strftime("%H:%M:%S")
+        except (TypeError, ValueError, OSError):
+            time_text = "未知时间"
         parts = []
-        captions = []
-        images = []
-        for comp in event.get_messages():
-            if isinstance(comp, Plain):
-                if comp.text: parts.append(comp.text)
-            elif isinstance(comp, Image):
-                if self._visual_group_enabled(event):
-                    caption = await self._caption_group_image(comp)
-                    parts.append(f"[图片：{caption}]" if caption else "[图片：理解失败]")
-                    captions.append(caption)
+        caption_index = 0
+        for segment in msg.get("message", []) or []:
+            segment_type = str(segment.get("type", ""))
+            data = segment.get("data", {}) or {}
+            if segment_type == "text":
+                text = str(data.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+            elif segment_type == "image":
+                if caption_index < len(captions):
+                    parts.append(f"[图片：{captions[caption_index]}]")
                 else:
                     parts.append("[图片]")
-                images.append(comp)
-            elif isinstance(comp, At):
-                target = comp.name or comp.qq
-                parts.append(f"[At:{target}]")
-            elif isinstance(comp, Reply):
-                sender = comp.sender_nickname or comp.sender_id or "未知用户"
-                quoted_text = (comp.message_str or "").strip()
-                if quoted_text: parts.append(f"[引用 {sender}：{quoted_text}]")
-                else: parts.append(f"[引用 {sender} 的消息]")
+                caption_index += 1
+            elif segment_type == "at":
+                parts.append(f"[At:{data.get('name') or data.get('qq') or '未知'}]")
+            elif segment_type == "reply":
+                parts.append(f"[引用消息:{data.get('id') or '未知'}]")
+            elif segment_type == "face":
+                parts.append(f"[表情:{data.get('id') or ''}]")
+            elif segment_type == "record":
+                parts.append("[语音]")
+            elif segment_type == "video":
+                parts.append("[视频]")
+            elif segment_type == "file":
+                parts.append(f"[文件:{data.get('name') or data.get('file') or '未知'}]")
+        content = " ".join(part for part in parts if part).strip()
+        if not content:
+            return ""
+        return f"[{sender_name}（{sender_id}）/{time_text}]: {content}"
 
-        content = " ".join(part.strip() for part in parts if part and part.strip())
-        if not content: return None, captions, images
-
-        sender_name = event.get_sender_name() or str(event.get_sender_id())
-        sender_id = str(event.get_sender_id())
-        timestamp = getattr(event.message_obj, "timestamp", None)
-        try:
-            time_text = datetime.datetime.fromtimestamp(int(timestamp)).strftime("%H:%M:%S")
-        except (TypeError, ValueError, OSError):
-            time_text = datetime.datetime.now().strftime("%H:%M:%S")
-        record = f"[{sender_name}（{sender_id}）/{time_text}]: {content}"
-        return record, captions, images
-
-    def _get_group_visual_history_text(self, group_id: str, current_message_id: str = "") -> str:
-        history = self.group_visual_history.get(group_id, [])
-        records = [item["record"] for item in history if not current_message_id or item.get("message_id") != current_message_id]
+    async def _load_latest_group_history(self, event: AstrMessageEvent) -> str:
+        if event.get_platform_name() != "aiocqhttp":
+            logger.warning("群聊即时上下文仅支持 aiocqhttp/NapCat，当前平台已跳过")
+            return ""
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", bot)
+        if not api or not hasattr(api, "call_action"):
+            logger.warning("无法取得 NapCat API，群聊即时上下文已跳过")
+            return ""
+        group_id = str(event.get_group_id() or "")
+        count = max(1, int(self.config.get("group_visual_max_messages", 80)))
+        result = await asyncio.wait_for(
+            api.call_action(
+                "get_group_msg_history",
+                group_id=int(group_id) if group_id.isdigit() else group_id,
+                message_seq=0,
+                count=count,
+                reverseOrder=False,
+            ),
+            timeout=15,
+        )
+        raw_messages = result.get("messages", []) if isinstance(result, dict) else []
+        current_message_id = str(event.message_obj.message_id or "")
+        messages = [
+            msg for msg in raw_messages
+            if str(msg.get("message_id", "")) != current_message_id
+        ]
+        messages.sort(
+            key=lambda msg: (
+                int(msg.get("time", 0) or 0),
+                str(msg.get("message_id", "")),
+            )
+        )
+        message_ids = [str(msg.get("message_id", "")) for msg in messages]
+        caption_map = await self._get_captions_by_message_ids(
+            self._group_cache_session_id(event),
+            message_ids,
+        )
+        records = []
+        for msg in messages[-count:]:
+            message_id = str(msg.get("message_id", ""))
+            record = self._format_onebot_history_message(msg, caption_map.get(message_id, []))
+            if record:
+                records.append(record)
         return "\n---\n".join(records)
 
     def _inject_group_chat_context(self, req: ProviderRequest, history_text: str) -> str:
@@ -189,23 +455,37 @@ class SysSettingPortPlugin(Star):
 
     @event_message_type(EventMessageType.GROUP_MESSAGE, priority=maxsize - 1)
     async def handle_group_visual_context(self, event: AstrMessageEvent):
-        if not self._group_context_enabled(event): return
-        if str(event.get_sender_id()) == str(event.get_self_id()): return
-
-        group_id = str(event.get_group_id())
-        async with self.group_visual_locks[group_id]:
-            record, captions, images = await self._build_group_history_message(event)
-            if not record: return
-
-            history = self.group_visual_history[group_id]
-            history.append({"message_id": str(event.message_obj.message_id or ""), "record": record})
-            max_messages = max(1, int(self.config.get("group_visual_max_messages", 80)))
-            if len(history) > max_messages: del history[:-max_messages]
-
-            message_id = str(event.message_obj.message_id or "")
-            if message_id and images:
-                cache_limit = int(self.config.get("group_visual_cache_size", 300))
-                self._cache_put(self.message_image_cache, message_id, {"captions": captions, "sender_name": event.get_sender_name() or str(event.get_sender_id()), "sender_id": str(event.get_sender_id())}, cache_limit)
+        if not self._visual_group_enabled(event):
+            return
+        if str(event.get_sender_id()) == str(event.get_self_id()):
+            return
+        images = [comp for comp in event.get_messages() if isinstance(comp, Image)]
+        message_id = str(event.message_obj.message_id or "")
+        if not images or not message_id:
+            return
+        cache_session_id = self._group_cache_session_id(event)
+        existing = await self._get_message_captions(cache_session_id, message_id)
+        if len(existing) >= len(images):
+            return
+        captions = []
+        for index, image in enumerate(images):
+            if index < len(existing):
+                continue
+            caption = await self._caption_group_image(image)
+            if caption:
+                captions.append((self._image_cache_key(image, index), caption))
+        if captions:
+            await self._save_message_captions(
+                cache_session_id,
+                message_id,
+                captions,
+                event.get_sender_name() or str(event.get_sender_id()),
+                str(event.get_sender_id()),
+            )
+            logger.info(
+                f"群聊静默图片描述已持久化: group={cache_session_id}, "
+                f"message={message_id}, images={len(captions)}"
+            )
 
     def _is_dnd_time(self, dnd_str: str) -> bool:
         if not dnd_str or "-" not in dnd_str: return False
@@ -370,15 +650,24 @@ class SysSettingPortPlugin(Star):
                 sender_name = (getattr(comp, "sender_nickname", None) or "未知用户").strip()
                 sender_id = getattr(comp, "sender_id", None)
                 source_label = f"{sender_name}（{sender_id}）" if sender_id and str(sender_id) not in sender_name else sender_name
-                cached = self.message_image_cache.get(str(comp.id))
-                if cached: quote_captions.extend(c for c in cached.get("captions", []) if c)
+                if event.get_group_id():
+                    quote_captions.extend(
+                        await self._get_message_captions(
+                            self._group_cache_session_id(event),
+                            str(comp.id),
+                        )
+                    )
                 new_chain = []
-                for c in comp.chain:
-                    if isinstance(c, Image): quote_images.append(c); quote_sources.append(source_label)
-                    else: new_chain.append(c)
+                for component in comp.chain:
+                    if isinstance(component, Image):
+                        quote_images.append(component)
+                        quote_sources.append(source_label)
+                    else:
+                        new_chain.append(component)
                 comp.chain = new_chain
         if quote_images:
-            for img in quote_images: event.message_obj.message.append(img)
+            for image in quote_images:
+                event.message_obj.message.append(image)
             event.set_extra("sys_setting_port_quote_images", quote_images)
             event.set_extra("sys_setting_port_quote_sources", quote_sources)
             event.set_extra("sys_setting_port_quote_captions", quote_captions)
@@ -422,8 +711,20 @@ class SysSettingPortPlugin(Star):
                 req.extra_user_content_parts = []
             req.extra_user_content_parts.append(TextPart(text=f"\n{caption_text}"))
             return "private_persistent_user_content"
-        req.system_prompt = f"{req.system_prompt or ''}\n{caption_text}\n"
-        return "group_temporary_system_prompt"
+        pending = list(event.get_extra("sys_setting_port_pending_captions", []))
+        if caption_text not in pending:
+            pending.append(caption_text)
+        event.set_extra("sys_setting_port_pending_captions", pending)
+        return "group_pending_temporary_context"
+
+    @staticmethod
+    def _inject_temporary_user_context(req: ProviderRequest, text: str) -> int:
+        if req.contexts is None:
+            req.contexts = []
+        temporary_message = Message(role="user", content=text)
+        object.__setattr__(temporary_message, "_no_save", True)
+        req.contexts.append(temporary_message)
+        return len(req.contexts) - 1
 
     async def _try_caption(self, provider_id: str, prompt: str, image_urls: list, max_retries: int) -> str:
         prov = self.context.get_provider_by_id(provider_id)
@@ -453,79 +754,106 @@ class SysSettingPortPlugin(Star):
 
     @on_llm_request(priority=-maxsize)
     async def inject_group_context_finally(self, event: AstrMessageEvent, req: ProviderRequest):
-        if not self._group_context_enabled(event):
+        if event.is_private_chat():
             return
-        group_id = str(event.get_group_id())
-        history_text = self._get_group_visual_history_text(group_id, str(event.message_obj.message_id or ""))
-        if not history_text:
-            logger.debug(f"群聊上下文无可注入历史: group={group_id}")
-            return
-        injection_mode = self._inject_group_chat_context(req, history_text)
-        context_position = next(
-            (
-                index
-                for index, message in enumerate(req.contexts or [])
-                if "<group_chat_context>"
-                in str(message.content if isinstance(message, Message) else message.get("content", ""))
-            ),
-            -1,
-        )
-        logger.info(
-            f"群聊上下文已最终注入: group={group_id}, mode={injection_mode}, "
-            f"position={context_position}, records={history_text.count(chr(10) + '---' + chr(10)) + 1}, "
-            f"chars={len(history_text)}"
-        )
+
+        group_id = str(event.get_group_id() or "")
+        if self._group_context_enabled(event):
+            try:
+                history_text = await self._load_latest_group_history(event)
+            except Exception as e:
+                history_text = ""
+                logger.error(f"从 NapCat 获取最新群聊上下文失败: group={group_id}, error={e}")
+            if history_text:
+                injection_mode = self._inject_group_chat_context(req, history_text)
+                context_position = next(
+                    (
+                        index
+                        for index, message in enumerate(req.contexts or [])
+                        if "<group_chat_context>"
+                        in str(message.content if isinstance(message, Message) else message.get("content", ""))
+                    ),
+                    -1,
+                )
+                logger.info(
+                    f"群聊上下文已最终注入: group={group_id}, mode={injection_mode}, "
+                    f"position={context_position}, records={history_text.count(chr(10) + '---' + chr(10)) + 1}, "
+                    f"chars={len(history_text)}"
+                )
+            else:
+                logger.debug(f"群聊上下文无可注入历史: group={group_id}")
+
+        pending_captions = event.get_extra("sys_setting_port_pending_captions", [])
+        for caption_text in pending_captions:
+            position = self._inject_temporary_user_context(
+                req,
+                f"<current_image_caption>\n{caption_text}\n</current_image_caption>",
+            )
+            logger.info(
+                f"【图片转述｜最终注入】group={group_id}, mode=temporary_context, "
+                f"position={position}, chars={len(caption_text)}"
+            )
 
     @on_llm_request()
     async def on_image_caption_req(self, event: AstrMessageEvent, req: ProviderRequest):
-        caption_provider_id, fallback_provider_id, target_models = self.config.get("caption_provider_id", ""), self.config.get("fallback_provider_id", ""), self.config.get("target_models", [])
-        caption_prompt, max_retries = self.config.get("caption_prompt", "请详细描述这张图片的内容，以便纯文本模型能够理解。"), int(self.config.get("max_retries", 3))
+        caption_provider_id = self.config.get("caption_provider_id", "")
+        fallback_provider_id = self.config.get("fallback_provider_id", "")
+        target_models = self.config.get("target_models", [])
+        caption_prompt = self.config.get("caption_prompt", "请详细描述这张图片的内容，以便纯文本模型能够理解。")
+        max_retries = int(self.config.get("max_retries", 3))
         curr_prov = self.context.get_using_provider(event.unified_msg_origin)
         is_target_text_model, matched_keyword, model_candidates = self._match_target_model(req, curr_prov, target_models)
-        image_urls = list(req.image_urls) if req.image_urls else []
+
+        all_paths = list(req.image_urls or [])
         for comp in event.message_obj.message:
             if isinstance(comp, Image):
                 path = await comp.convert_to_file_path()
-                if path not in image_urls: image_urls.append(path)
-        if not image_urls: return
-        req.image_urls = image_urls
-        quote_sources, quote_captions, quote_images = event.get_extra("sys_setting_port_quote_sources", []), event.get_extra("sys_setting_port_quote_captions", []), event.get_extra("sys_setting_port_quote_images", [])
-        inspect_keywords = self.config.get("quote_image_inspect_keywords", ["仔细看", "看原图", "看细节", "重新看", "重看", "再看"])
-        wants_original = bool(quote_images) and not is_target_text_model and any(k and k in (req.prompt or "") for k in inspect_keywords)
-        if quote_images and not quote_captions and not wants_original and self._visual_group_enabled(event) and self.config.get("group_visual_provider_id"):
-            for image in quote_images:
-                caption = await self._caption_group_image(image)
-                if caption: quote_captions.append(caption)
-        
-        if quote_sources and not event.is_private_chat():
-            req.system_prompt = (req.system_prompt or "") + f"\n[系统附加信息 - 引用图片来源：{'；'.join(dict.fromkeys(quote_sources))}。图片属于被引用消息中的原发送者，不是当前发言者。]\n"
+                if path not in all_paths:
+                    all_paths.append(path)
+        if not all_paths:
+            return
+        req.image_urls = all_paths
 
+        quote_sources = event.get_extra("sys_setting_port_quote_sources", [])
+        quote_captions = list(event.get_extra("sys_setting_port_quote_captions", []))
+        quote_images = event.get_extra("sys_setting_port_quote_images", [])
         quote_paths = []
         for image in quote_images:
-            try: quote_paths.append(await image.convert_to_file_path())
-            except Exception: pass
-        if quote_images and not wants_original:
-            req.image_urls = [p for p in req.image_urls if p not in quote_paths]
-            image_urls = [p for p in image_urls if p not in quote_paths]
-        if quote_captions and not wants_original:
-            cached_caption_text = (
-                f"[被引用图片的既有描述（来自 {'；'.join(dict.fromkeys(quote_sources)) or '原发送者'}）]: "
-                f"{'；'.join(quote_captions)}"
-            )
-            cached_injection_mode = self._inject_caption_text(event, req, cached_caption_text)
-            logger.info(
-                f"【图片转述｜成功】provider=群聊图片描述缓存, mode={cached_injection_mode}, "
-                f"chars={len('；'.join(quote_captions))}, images={len(quote_images)}"
-            )
-            if not image_urls:
-                return
+            try:
+                path = await image.convert_to_file_path()
+                if path not in quote_paths:
+                    quote_paths.append(path)
+            except Exception:
+                pass
+        current_paths = [path for path in all_paths if path not in quote_paths]
+        source_text = "；".join(dict.fromkeys(quote_sources)) or "原发送者"
+        inspect_keywords = self.config.get("quote_image_inspect_keywords", ["仔细看", "看原图", "看细节", "重新看", "重看", "再看"])
+        wants_original = bool(quote_paths) and not is_target_text_model and any(
+            keyword and keyword in (req.prompt or "") for keyword in inspect_keywords
+        )
+
         if not is_target_text_model:
-            logger.debug(
-                f"【图片转述｜未触发】未匹配纯文本模型关键词；candidates={model_candidates}, "
-                f"keywords={[str(item).strip() for item in target_models or []]}"
-            )
+            if quote_paths and not wants_original:
+                if not quote_captions and self._visual_group_enabled(event) and self.config.get("group_visual_provider_id"):
+                    for image in quote_images:
+                        caption = await self._caption_group_image(image)
+                        if caption:
+                            quote_captions.append(caption)
+                req.image_urls = current_paths
+                if quote_captions:
+                    caption_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
+                    mode = self._inject_caption_text(event, req, caption_text)
+                    logger.info(
+                        f"【图片转述｜成功】provider=群聊图片描述缓存, mode={mode}, "
+                        f"chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
+                    )
             return
+
         req.image_urls = []
+        req.extra_user_content_parts = [
+            part for part in (req.extra_user_content_parts or [])
+            if not (isinstance(part, TextPart) and "[Image Attachment: path" in part.text)
+        ]
         if not caption_provider_id:
             logger.warning(
                 f"【图片转述｜失败】已匹配关键词 {matched_keyword}，但未配置多模态转述模型；"
@@ -533,37 +861,47 @@ class SysSettingPortPlugin(Star):
             )
             return
 
-        caption_provider = self.context.get_provider_by_id(caption_provider_id)
-        logger.info(
-            f"【图片转述｜触发】目标关键词={matched_keyword}, current_models={model_candidates}, "
-            f"caption_provider={self._provider_log_name(caption_provider_id, caption_provider)}, images={len(image_urls)}"
-        )
-        caption = await self._try_caption(caption_provider_id, caption_prompt, image_urls, max_retries)
-        used_provider_id = caption_provider_id
-        used_provider = caption_provider
-        if not caption and fallback_provider_id:
-            fallback_provider = self.context.get_provider_by_id(fallback_provider_id)
-            logger.warning(
-                f"【图片转述｜主模型失败】准备调用兜底模型 "
-                f"{self._provider_log_name(fallback_provider_id, fallback_provider)}"
+        async def caption_batch(paths: list[str], kind: str, source: str = ""):
+            if not paths:
+                return
+            caption_provider = self.context.get_provider_by_id(caption_provider_id)
+            logger.info(
+                f"【图片转述｜触发】kind={kind}, 目标关键词={matched_keyword}, "
+                f"current_models={model_candidates}, caption_provider="
+                f"{self._provider_log_name(caption_provider_id, caption_provider)}, images={len(paths)}"
             )
-            caption = await self._try_caption(fallback_provider_id, caption_prompt, image_urls, max_retries)
-            used_provider_id = fallback_provider_id
-            used_provider = fallback_provider
-        if not caption:
-            logger.error(
-                f"【图片转述｜失败】所有转述模型均未返回有效描述；target={matched_keyword}, images={len(image_urls)}"
+            caption = await self._try_caption(caption_provider_id, caption_prompt, paths, max_retries)
+            used_provider_id, used_provider = caption_provider_id, caption_provider
+            if not caption and fallback_provider_id:
+                fallback_provider = self.context.get_provider_by_id(fallback_provider_id)
+                logger.warning(
+                    f"【图片转述｜主模型失败】kind={kind}, 准备调用兜底模型 "
+                    f"{self._provider_log_name(fallback_provider_id, fallback_provider)}"
+                )
+                caption = await self._try_caption(fallback_provider_id, caption_prompt, paths, max_retries)
+                used_provider_id, used_provider = fallback_provider_id, fallback_provider
+            if not caption:
+                logger.error(
+                    f"【图片转述｜失败】kind={kind}, 所有转述模型均未返回有效描述；"
+                    f"target={matched_keyword}, images={len(paths)}"
+                )
+                return
+            source_note = f"（来自被引用消息的 {source}，不是当前发言者）" if source else "（当前消息图片）"
+            caption_text = f"[图片转述内容]{source_note}: {caption}"
+            mode = self._inject_caption_text(event, req, caption_text)
+            logger.info(
+                f"【图片转述｜成功】kind={kind}, provider="
+                f"{self._provider_log_name(used_provider_id, used_provider)}, "
+                f"mode={mode}, chars={len(caption)}, images={len(paths)}"
             )
-            return
 
-        req.extra_user_content_parts = [
-            part for part in (req.extra_user_content_parts or [])
-            if not (isinstance(part, TextPart) and "[Image Attachment: path" in part.text)
-        ]
-        caption_source = f"（图片来自被引用消息的 {'；'.join(dict.fromkeys(quote_sources))}，不是当前发言者）" if quote_sources else ""
-        caption_text = f"[图片转述内容]{caption_source}: {caption}"
-        injection_mode = self._inject_caption_text(event, req, caption_text)
-        logger.info(
-            f"【图片转述｜成功】provider={self._provider_log_name(used_provider_id, used_provider)}, "
-            f"mode={injection_mode}, chars={len(caption)}, images={len(image_urls)}"
-        )
+        if quote_captions:
+            cached_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
+            mode = self._inject_caption_text(event, req, cached_text)
+            logger.info(
+                f"【图片转述｜成功】kind=quoted_cached, provider=群聊图片描述缓存, "
+                f"mode={mode}, chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
+            )
+        else:
+            await caption_batch(quote_paths, "quoted_uncached", source_text)
+        await caption_batch(current_paths, "current", "")
