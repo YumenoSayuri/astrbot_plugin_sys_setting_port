@@ -1,8 +1,10 @@
 import asyncio
 import copy
 import datetime
+import hashlib
 import os
 import time
+from collections import Counter
 from sys import maxsize
 
 import aiosqlite
@@ -18,7 +20,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.0", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.5", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -215,6 +217,24 @@ class SysSettingPortPlugin(Star):
                     "CREATE INDEX IF NOT EXISTS idx_group_image_session_time "
                     "ON group_image_captions(session_id, created_at DESC)"
                 )
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS group_image_fingerprints (
+                        session_id TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        position INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        caption TEXT NOT NULL,
+                        image_count INTEGER NOT NULL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY (session_id, message_id, position)
+                    )
+                    """
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_group_image_fingerprint_sha_time "
+                    "ON group_image_fingerprints(sha256, created_at DESC)"
+                )
                 await db.commit()
             self.caption_db_ready = True
 
@@ -307,6 +327,134 @@ class SysSettingPortPlugin(Star):
                     """,
                     (session_id, session_id, per_session_limit),
                 )
+                await db.execute(
+                    """
+                    DELETE FROM group_image_fingerprints
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM group_image_captions captions
+                        WHERE captions.session_id = group_image_fingerprints.session_id
+                        AND captions.message_id = group_image_fingerprints.message_id
+                    )
+                    """
+                )
+                await db.commit()
+
+    @staticmethod
+    def _hash_image_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file:
+            while chunk := file.read(65536):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    async def _hash_image_paths(self, paths: list[str]) -> list[str]:
+        selected_paths = paths[:1] if len(paths) == 1 else paths[:3]
+        return [
+            await asyncio.to_thread(self._hash_image_file, path)
+            for path in selected_paths
+        ]
+
+    async def _find_reusable_image_caption(self, hashes: list[str]) -> str:
+        if not hashes:
+            return ""
+        await self._ensure_caption_db()
+        ttl_seconds = self._caption_cache_ttl_seconds()
+        unique_hashes = list(dict.fromkeys(hashes))
+        placeholders = ",".join("?" for _ in unique_hashes)
+        query = (
+            "SELECT session_id, message_id, position, sha256, caption, "
+            "image_count, created_at FROM group_image_fingerprints "
+            f"WHERE sha256 IN ({placeholders})"
+        )
+        params = list(unique_hashes)
+        if ttl_seconds > 0:
+            query += " AND created_at >= ?"
+            params.append(time.time() - ttl_seconds)
+        query += " ORDER BY created_at DESC"
+        async with aiosqlite.connect(self.caption_db_path) as db:
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+
+        candidates = {}
+        for session_id, message_id, position, sha256, caption, image_count, created_at in rows:
+            key = (str(session_id), str(message_id))
+            candidate = candidates.setdefault(
+                key,
+                {
+                    "hashes": [],
+                    "caption": str(caption),
+                    "image_count": int(image_count),
+                    "created_at": float(created_at),
+                },
+            )
+            candidate["hashes"].append((int(position), str(sha256)))
+
+        current_counter = Counter(hashes)
+        for candidate in sorted(
+            candidates.values(),
+            key=lambda item: item["created_at"],
+            reverse=True,
+        ):
+            candidate_hashes = [
+                sha256 for _, sha256 in sorted(candidate["hashes"])
+            ]
+            if len(hashes) == 1:
+                if candidate["image_count"] == 1 and candidate_hashes == hashes:
+                    return candidate["caption"]
+                continue
+            overlap = sum(
+                (current_counter & Counter(candidate_hashes)).values()
+            )
+            if candidate["image_count"] >= 2 and overlap >= 2:
+                return candidate["caption"]
+        return ""
+
+    async def _save_image_fingerprints(
+        self,
+        session_id: str,
+        message_id: str,
+        hashes: list[str],
+        caption: str,
+        image_count: int,
+    ):
+        caption = str(caption).strip()
+        if not session_id or not message_id or not hashes or not caption:
+            return
+        await self._ensure_caption_db()
+        now = time.time()
+        ttl_seconds = self._caption_cache_ttl_seconds()
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                await db.execute("PRAGMA busy_timeout=10000")
+                await db.execute(
+                    "DELETE FROM group_image_fingerprints "
+                    "WHERE session_id = ? AND message_id = ?",
+                    (session_id, message_id),
+                )
+                await db.executemany(
+                    """
+                    INSERT INTO group_image_fingerprints
+                    (session_id, message_id, position, sha256, caption, image_count, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            session_id,
+                            message_id,
+                            position,
+                            sha256,
+                            caption,
+                            image_count,
+                            now,
+                        )
+                        for position, sha256 in enumerate(hashes)
+                    ],
+                )
+                if ttl_seconds > 0:
+                    await db.execute(
+                        "DELETE FROM group_image_fingerprints WHERE created_at < ?",
+                        (now - ttl_seconds,),
+                    )
                 await db.commit()
 
     @staticmethod
@@ -317,21 +465,67 @@ class SysSettingPortPlugin(Star):
             or f"image_{index}"
         )
 
-    async def _caption_group_image(self, image: Image) -> str:
+    async def _resolve_group_image_paths(
+        self,
+        event: AstrMessageEvent,
+        images: list[Image],
+    ) -> list[str]:
+        paths = []
+        for index, image in enumerate(images):
+            path = await self._resolve_valid_image_path(
+                event,
+                image,
+                kind="group_silent",
+                index=index,
+            )
+            if path:
+                paths.append(path)
+        if len(paths) != len(images):
+            logger.warning(
+                f"群聊图片理解跳过无效图片: total={len(images)}, valid={len(paths)}"
+            )
+        return paths
+
+    async def _caption_group_images(
+        self,
+        event: AstrMessageEvent,
+        images: list[Image],
+        paths: list[str] | None = None,
+    ) -> str:
         provider_id = self.config.get("group_visual_provider_id", "")
-        if not provider_id:
+        if not provider_id or not images:
             return ""
         prompt = self.config.get(
             "group_visual_prompt",
             "请用简洁准确的中文描述图片中的主体、动作、场景、文字和重要细节，供群聊上下文理解。只输出图片描述。",
         )
+        if len(images) > 1:
+            prompt += f"\n本条消息包含 {len(images)} 张图片，请按图片顺序给出一份联合描述并说明它们之间的关系。"
         max_retries = max(1, int(self.config.get("max_retries", 3)))
         try:
-            path = await image.convert_to_file_path()
-            return await self._try_caption(provider_id, prompt, [path], max_retries)
+            if paths is None:
+                paths = await self._resolve_group_image_paths(event, images)
+            if not paths:
+                logger.error(
+                    f"群聊图片理解已取消: images={len(images)}，没有可发送的有效图片"
+                )
+                return ""
+            return await self._try_caption(provider_id, prompt, paths, max_retries)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"群聊图片理解失败: {e}")
+            logger.error(
+                f"群聊图片理解失败: images={len(images)}, error={type(e).__name__}: {e}",
+                exc_info=True,
+            )
             return ""
+
+    async def _caption_group_image(
+        self,
+        event: AstrMessageEvent,
+        image: Image,
+    ) -> str:
+        return await self._caption_group_images(event, [image])
 
     @staticmethod
     def _format_onebot_history_message(msg: dict, captions: list[str]) -> str:
@@ -344,6 +538,10 @@ class SysSettingPortPlugin(Star):
             time_text = "未知时间"
         parts = []
         caption_index = 0
+        image_count = sum(
+            1 for segment in (msg.get("message", []) or [])
+            if str(segment.get("type", "")) == "image"
+        )
         for segment in msg.get("message", []) or []:
             segment_type = str(segment.get("type", ""))
             data = segment.get("data", {}) or {}
@@ -352,7 +550,12 @@ class SysSettingPortPlugin(Star):
                 if text:
                     parts.append(text)
             elif segment_type == "image":
-                if caption_index < len(captions):
+                if len(captions) == 1 and image_count > 1:
+                    if caption_index == 0:
+                        parts.append(f"[本消息多图联合描述：{captions[0]}]")
+                    else:
+                        parts.append("[同组图片]")
+                elif caption_index < len(captions):
                     parts.append(f"[图片：{captions[caption_index]}]")
                 else:
                     parts.append("[图片]")
@@ -465,26 +668,55 @@ class SysSettingPortPlugin(Star):
             return
         cache_session_id = self._group_cache_session_id(event)
         existing = await self._get_message_captions(cache_session_id, message_id)
-        if len(existing) >= len(images):
+        if existing:
             return
-        captions = []
-        for index, image in enumerate(images):
-            if index < len(existing):
-                continue
-            caption = await self._caption_group_image(image)
+        logger.info(
+            f"群聊静默图片理解已触发: group={cache_session_id}, "
+            f"message={message_id}, images={len(images)}"
+        )
+        try:
+            paths = await self._resolve_group_image_paths(event, images)
+            if not paths:
+                logger.error(
+                    f"群聊图片理解已取消: images={len(images)}，没有可发送的有效图片"
+                )
+                return
+            hashes = await self._hash_image_paths(paths)
+            caption = await self._find_reusable_image_caption(hashes)
+            reused = bool(caption)
+            if reused:
+                logger.info(
+                    f"群聊静默图片描述已按 SHA-256 复用: group={cache_session_id}, "
+                    f"message={message_id}, images={len(images)}, hashed={len(hashes)}"
+                )
+            else:
+                caption = await self._caption_group_images(event, images, paths)
             if caption:
-                captions.append((self._image_cache_key(image, index), caption))
-        if captions:
-            await self._save_message_captions(
-                cache_session_id,
-                message_id,
-                captions,
-                event.get_sender_name() or str(event.get_sender_id()),
-                str(event.get_sender_id()),
-            )
-            logger.info(
-                f"群聊静默图片描述已持久化: group={cache_session_id}, "
-                f"message={message_id}, images={len(captions)}"
+                await self._save_message_captions(
+                    cache_session_id,
+                    message_id,
+                    [("message_image_bundle", caption)],
+                    event.get_sender_name() or str(event.get_sender_id()),
+                    str(event.get_sender_id()),
+                )
+                await self._save_image_fingerprints(
+                    cache_session_id,
+                    message_id,
+                    hashes,
+                    caption,
+                    len(images),
+                )
+                logger.info(
+                    f"群聊静默图片描述已持久化: group={cache_session_id}, "
+                    f"message={message_id}, images={len(images)}, reused={reused}"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                f"群聊静默图片去重或理解失败: group={cache_session_id}, "
+                f"message={message_id}, error={type(e).__name__}: {e}",
+                exc_info=True,
             )
 
     def _is_dnd_time(self, dnd_str: str) -> bool:
@@ -726,30 +958,240 @@ class SysSettingPortPlugin(Star):
         req.contexts.append(temporary_message)
         return len(req.contexts) - 1
 
+    @staticmethod
+    def _inspect_image_path(path: str) -> tuple[bool, str]:
+        try:
+            if not os.path.exists(path):
+                return False, "不存在"
+            size = os.path.getsize(path)
+            if size < 16:
+                return False, f"空/过小文件(size={size})"
+            with open(path, "rb") as file:
+                header = file.read(16)
+            signatures = {
+                b"\xFF\xD8\xFF": "jpeg",
+                b"\x89PNG\r\n\x1a\n": "png",
+                b"GIF8": "gif",
+                b"BM": "bmp",
+                b"II*\x00": "tiff",
+                b"MM\x00*": "tiff",
+            }
+            kind = next(
+                (name for signature, name in signatures.items() if header.startswith(signature)),
+                "",
+            )
+            if not kind and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+                kind = "webp"
+            if not kind:
+                return False, f"unknown(size={size})"
+            return True, f"{kind}(size={size})"
+        except Exception as e:
+            return False, f"检查失败({type(e).__name__}: {e})"
+
+    @classmethod
+    def _describe_image_path(cls, path: str) -> str:
+        return cls._inspect_image_path(path)[1]
+
+    async def _resolve_valid_image_path(
+        self,
+        event: AstrMessageEvent,
+        image: Image,
+        prepared_path: str = "",
+        kind: str = "image",
+        index: int = 0,
+    ) -> str:
+        candidates = []
+        if prepared_path:
+            candidates.append(("astrbot_prepared", prepared_path))
+        component_path = str(getattr(image, "path", "") or "")
+        if component_path and component_path != prepared_path:
+            candidates.append(("component_path", component_path))
+
+        for source, path in candidates:
+            valid, diagnostic = self._inspect_image_path(path)
+            if valid:
+                logger.info(
+                    f"【图片转述｜载荷就绪】kind={kind}, source={source}, "
+                    f"index={index}, payload={diagnostic}"
+                )
+                return path
+            logger.warning(
+                f"【图片转述｜候选载荷无效】kind={kind}, source={source}, "
+                f"index={index}, payload={diagnostic}"
+            )
+
+        try:
+            converted_path = await image.convert_to_file_path()
+            valid, diagnostic = self._inspect_image_path(converted_path)
+            if valid:
+                logger.info(
+                    f"【图片转述｜载荷就绪】kind={kind}, source=component_convert, "
+                    f"index={index}, payload={diagnostic}"
+                )
+                return converted_path
+            logger.warning(
+                f"【图片转述｜组件载荷无效】kind={kind}, index={index}, "
+                f"payload={diagnostic}；正在请求 NapCat get_image"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"【图片转述｜组件转换失败】kind={kind}, index={index}, "
+                f"error={type(e).__name__}: {e}；正在请求 NapCat get_image"
+            )
+
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", bot)
+        file_id = str(getattr(image, "file", "") or "")
+        if api and hasattr(api, "call_action") and file_id:
+            try:
+                result = await asyncio.wait_for(
+                    api.call_action("get_image", file=file_id),
+                    timeout=15.0,
+                )
+                if isinstance(result, dict):
+                    protocol_url = str(result.get("url") or "")
+                    if protocol_url.startswith(("http://", "https://", "base64://")):
+                        try:
+                            protocol_path = await Image(file=protocol_url).convert_to_file_path()
+                            valid, diagnostic = self._inspect_image_path(protocol_path)
+                            if valid:
+                                logger.info(
+                                    f"【图片转述｜载荷就绪】kind={kind}, "
+                                    f"source=napcat_get_image_url, index={index}, "
+                                    f"payload={diagnostic}"
+                                )
+                                return protocol_path
+                            logger.warning(
+                                f"【图片转述｜NapCat URL 载荷无效】kind={kind}, "
+                                f"index={index}, payload={diagnostic}"
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.warning(
+                                f"【图片转述｜NapCat URL 获取失败】kind={kind}, "
+                                f"index={index}, error={type(e).__name__}: {e}"
+                            )
+
+                    for field in ("file", "path"):
+                        protocol_path = str(result.get(field) or "")
+                        if not protocol_path:
+                            continue
+                        valid, diagnostic = self._inspect_image_path(protocol_path)
+                        if valid:
+                            logger.info(
+                                f"【图片转述｜载荷就绪】kind={kind}, "
+                                f"source=napcat_get_image_{field}, index={index}, "
+                                f"payload={diagnostic}"
+                            )
+                            return protocol_path
+
+                    logger.error(
+                        f"【图片转述｜NapCat 载荷无效】kind={kind}, index={index}, "
+                        f"fields={sorted(result.keys())}, has_url={bool(protocol_url)}"
+                    )
+                else:
+                    logger.error(
+                        f"【图片转述｜NapCat 载荷无效】kind={kind}, index={index}, "
+                        f"result_type={type(result).__name__}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"【图片转述｜NapCat get_image 失败】kind={kind}, index={index}, "
+                    f"error={type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+
+        logger.error(
+            f"【图片转述｜图片载荷无效】kind={kind}, index={index}；"
+            "所有来源均无有效图片，已阻止向 Provider 发送"
+        )
+        return ""
+
     async def _try_caption(self, provider_id: str, prompt: str, image_urls: list, max_retries: int) -> str:
+        invalid_payloads = [
+            self._describe_image_path(path)
+            for path in image_urls
+            if not self._inspect_image_path(path)[0]
+        ]
+        if not image_urls or invalid_payloads:
+            logger.error(
+                f"【图片转述｜调用已阻止】provider={provider_id}, images={len(image_urls)}, "
+                f"invalid={invalid_payloads or ['empty']}"
+            )
+            return ""
         prov = self.context.get_provider_by_id(provider_id)
-        if not prov: return ""
+        if not prov:
+            logger.error(f"【图片转述｜调用失败】未找到 Provider: {provider_id}")
+            return ""
         structured_enabled = self.config.get("enable_caption_structured", True)
         judge_enabled, judge_provider_id, judge_prompt_tmpl = self.config.get("enable_caption_judge", False), self.config.get("caption_judge_provider_id", ""), self.config.get("caption_judge_prompt", "")
         if structured_enabled: prompt += "\n请务必将最终的图片描述内容包裹在 <caption_result> 标签中。如果无法描述，请输出 <error>原因</error>。"
         for attempt in range(max_retries):
             try:
-                resp = await asyncio.wait_for(prov.text_chat(system_prompt=prompt, prompt="[图片]", image_urls=image_urls), timeout=45.0)
-                if not resp or not resp.completion_text: continue
-                raw_text = resp.completion_text.strip(); caption = raw_text
+                logger.info(
+                    f"【图片转述｜调用 Provider】provider={self._provider_log_name(provider_id, prov)}, "
+                    f"attempt={attempt + 1}/{max_retries}, images={len(image_urls)}, "
+                    f"payload={[self._describe_image_path(path) for path in image_urls]}"
+                )
+                resp = await asyncio.wait_for(
+                    prov.text_chat(
+                        system_prompt=prompt,
+                        prompt="[图片]",
+                        image_urls=image_urls,
+                    ),
+                    timeout=45.0,
+                )
+                if not resp or not resp.completion_text:
+                    logger.warning(
+                        f"【图片转述｜Provider 空响应】provider={self._provider_log_name(provider_id, prov)}, "
+                        f"attempt={attempt + 1}/{max_retries}"
+                    )
+                    continue
+                raw_text = resp.completion_text.strip()
+                caption = raw_text
                 if structured_enabled:
                     import re
-                    if "<error>" in raw_text: continue
+                    if "<error>" in raw_text:
+                        logger.warning(
+                            f"【图片转述｜Provider 返回错误标签】provider="
+                            f"{self._provider_log_name(provider_id, prov)}, response={raw_text[:300]}"
+                        )
+                        continue
                     match = re.search(r"<caption_result>(.*?)</caption_result>", raw_text, re.DOTALL)
-                    if match: caption = match.group(1).strip()
+                    if match:
+                        caption = match.group(1).strip()
+                    else:
+                        logger.warning(
+                            f"【图片转述｜结构化标签缺失】provider="
+                            f"{self._provider_log_name(provider_id, prov)}，将直接使用原始响应"
+                        )
                 if judge_enabled and judge_provider_id and judge_prompt_tmpl:
                     judge_prov = self.context.get_provider_by_id(judge_provider_id)
                     if judge_prov:
                         j_resp = await asyncio.wait_for(judge_prov.text_chat(prompt=judge_prompt_tmpl.replace("{{caption}}", caption)), timeout=20.0)
-                        if j_resp and j_resp.completion_text and "否" in j_resp.completion_text.strip(): continue
-                if caption: return caption
-            except Exception: pass
-            if attempt < max_retries - 1: await asyncio.sleep(1.5)
+                        if j_resp and j_resp.completion_text and "否" in j_resp.completion_text.strip():
+                            logger.warning(
+                                f"【图片转述｜判定未通过】provider="
+                                f"{self._provider_log_name(provider_id, prov)}, attempt={attempt + 1}/{max_retries}"
+                            )
+                            continue
+                if caption:
+                    return caption
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"【图片转述｜Provider 调用异常】provider={self._provider_log_name(provider_id, prov)}, "
+                    f"attempt={attempt + 1}/{max_retries}, error={type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5)
         return ""
 
     @on_llm_request(priority=-maxsize)
@@ -804,28 +1246,49 @@ class SysSettingPortPlugin(Star):
         curr_prov = self.context.get_using_provider(event.unified_msg_origin)
         is_target_text_model, matched_keyword, model_candidates = self._match_target_model(req, curr_prov, target_models)
 
-        all_paths = list(req.image_urls or [])
-        for comp in event.message_obj.message:
-            if isinstance(comp, Image):
-                path = await comp.convert_to_file_path()
-                if path not in all_paths:
-                    all_paths.append(path)
-        if not all_paths:
-            return
-        req.image_urls = all_paths
-
         quote_sources = event.get_extra("sys_setting_port_quote_sources", [])
         quote_captions = list(event.get_extra("sys_setting_port_quote_captions", []))
         quote_images = event.get_extra("sys_setting_port_quote_images", [])
-        quote_paths = []
-        for image in quote_images:
-            try:
-                path = await image.convert_to_file_path()
-                if path not in quote_paths:
-                    quote_paths.append(path)
-            except Exception:
-                pass
-        current_paths = [path for path in all_paths if path not in quote_paths]
+        quote_image_ids = {id(image) for image in quote_images}
+        quote_paths, current_paths = [], []
+
+        import re
+        prepared_paths = list(req.image_urls or [])
+        if not prepared_paths:
+            for part in req.extra_user_content_parts or []:
+                if not isinstance(part, TextPart):
+                    continue
+                match = re.search(r"\[Image Attachment: path (.*?)\]", part.text)
+                if match:
+                    prepared_paths.append(match.group(1).strip())
+
+        image_components = []
+        seen_image_ids = set()
+        for component in event.message_obj.message:
+            if isinstance(component, Image) and id(component) not in seen_image_ids:
+                seen_image_ids.add(id(component))
+                image_components.append(component)
+
+        for index, component in enumerate(image_components):
+            image_kind = "quoted" if id(component) in quote_image_ids else "current"
+            prepared_path = prepared_paths[index] if index < len(prepared_paths) else ""
+            path = await self._resolve_valid_image_path(
+                event,
+                component,
+                prepared_path=prepared_path,
+                kind=image_kind,
+                index=index,
+            )
+            if not path:
+                continue
+            target_paths = quote_paths if id(component) in quote_image_ids else current_paths
+            if path not in target_paths:
+                target_paths.append(path)
+
+        all_paths = [*current_paths, *quote_paths]
+        if not all_paths:
+            return
+        req.image_urls = all_paths
         source_text = "；".join(dict.fromkeys(quote_sources)) or "原发送者"
         inspect_keywords = self.config.get("quote_image_inspect_keywords", ["仔细看", "看原图", "看细节", "重新看", "重看", "再看"])
         wants_original = bool(quote_paths) and not is_target_text_model and any(
@@ -836,7 +1299,7 @@ class SysSettingPortPlugin(Star):
             if quote_paths and not wants_original:
                 if not quote_captions and self._visual_group_enabled(event) and self.config.get("group_visual_provider_id"):
                     for image in quote_images:
-                        caption = await self._caption_group_image(image)
+                        caption = await self._caption_group_image(event, image)
                         if caption:
                             quote_captions.append(caption)
                 req.image_urls = current_paths
@@ -895,7 +1358,11 @@ class SysSettingPortPlugin(Star):
                 f"mode={mode}, chars={len(caption)}, images={len(paths)}"
             )
 
-        if quote_captions:
+        force_quote_reinspect = bool(quote_paths) and any(
+            keyword and keyword in (req.prompt or "")
+            for keyword in inspect_keywords
+        )
+        if quote_captions and not force_quote_reinspect:
             cached_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
             mode = self._inject_caption_text(event, req, cached_text)
             logger.info(
@@ -903,5 +1370,6 @@ class SysSettingPortPlugin(Star):
                 f"mode={mode}, chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
             )
         else:
-            await caption_batch(quote_paths, "quoted_uncached", source_text)
+            quote_kind = "quoted_reinspect" if force_quote_reinspect else "quoted_uncached"
+            await caption_batch(quote_paths, quote_kind, source_text)
         await caption_batch(current_paths, "current", "")

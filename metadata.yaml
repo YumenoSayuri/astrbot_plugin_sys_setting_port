@@ -1,5 +1,5 @@
 name: astrbot_plugin_sys_setting_port
 author: Nova
-version: 2.2.0
-description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。群消息不常驻内存，静默图片描述持久化到 SQLite 并按群限制容量。
+version: 2.2.5
+description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。新增基于 SHA-256 的重复图片描述复用。
 repo: https://github.com/YumenoSayuri/astrbot_plugin_sys_setting_port
