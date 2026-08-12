@@ -25,7 +25,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.8", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.9", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -341,19 +341,39 @@ class SysSettingPortPlugin(Star):
                         caption TEXT NOT NULL,
                         image_count INTEGER NOT NULL,
                         created_at REAL NOT NULL,
+                        hit_count INTEGER NOT NULL DEFAULT 1,
+                        first_seen REAL NOT NULL DEFAULT 0,
+                        last_seen REAL NOT NULL DEFAULT 0,
                         PRIMARY KEY (session_id, message_id, position)
                     )
                     """
                 )
+                cursor = await db.execute("PRAGMA table_info(group_image_fingerprints)")
+                fingerprint_columns = {str(row[1]) for row in await cursor.fetchall()}
+                for column, definition in (
+                    ("hit_count", "INTEGER NOT NULL DEFAULT 1"),
+                    ("first_seen", "REAL NOT NULL DEFAULT 0"),
+                    ("last_seen", "REAL NOT NULL DEFAULT 0"),
+                ):
+                    if column not in fingerprint_columns:
+                        await db.execute(
+                            f"ALTER TABLE group_image_fingerprints ADD COLUMN {column} {definition}"
+                        )
+                await db.execute(
+                    "UPDATE group_image_fingerprints SET "
+                    "hit_count = CASE WHEN hit_count < 1 THEN 1 ELSE hit_count END, "
+                    "first_seen = CASE WHEN first_seen <= 0 THEN created_at ELSE first_seen END, "
+                    "last_seen = CASE WHEN last_seen <= 0 THEN created_at ELSE last_seen END"
+                )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_group_image_fingerprint_sha_time "
-                    "ON group_image_fingerprints(sha256, created_at DESC)"
+                    "ON group_image_fingerprints(sha256, last_seen DESC)"
                 )
                 await db.commit()
             self.caption_db_ready = True
 
     def _caption_cache_ttl_seconds(self) -> int:
-        hours = max(0, int(self.config.get("group_visual_cache_ttl_hours", 8)))
+        hours = max(0, int(self.config.get("group_visual_cache_ttl_hours", 24)))
         return hours * 3600
 
     async def _get_captions_by_message_ids(
@@ -402,7 +422,6 @@ class SysSettingPortPlugin(Star):
             return
         await self._ensure_caption_db()
         now = time.time()
-        per_session_limit = max(1, int(self.config.get("group_visual_cache_size", 100)))
         ttl_seconds = self._caption_cache_ttl_seconds()
         async with self.caption_db_lock:
             async with aiosqlite.connect(self.caption_db_path) as db:
@@ -425,32 +444,9 @@ class SysSettingPortPlugin(Star):
                 )
                 if ttl_seconds > 0:
                     await db.execute(
-                        "DELETE FROM group_image_captions WHERE session_id = ? AND created_at < ?",
-                        (session_id, now - ttl_seconds),
+                        "DELETE FROM group_image_captions WHERE created_at < ?",
+                        (now - ttl_seconds,),
                     )
-                await db.execute(
-                    """
-                    DELETE FROM group_image_captions
-                    WHERE session_id = ? AND message_id NOT IN (
-                        SELECT message_id FROM group_image_captions
-                        WHERE session_id = ?
-                        GROUP BY message_id
-                        ORDER BY MAX(created_at) DESC
-                        LIMIT ?
-                    )
-                    """,
-                    (session_id, session_id, per_session_limit),
-                )
-                await db.execute(
-                    """
-                    DELETE FROM group_image_fingerprints
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM group_image_captions captions
-                        WHERE captions.session_id = group_image_fingerprints.session_id
-                        AND captions.message_id = group_image_fingerprints.message_id
-                    )
-                    """
-                )
                 await db.commit()
 
     @staticmethod
@@ -472,41 +468,38 @@ class SysSettingPortPlugin(Star):
         if not hashes:
             return ""
         await self._ensure_caption_db()
-        ttl_seconds = self._caption_cache_ttl_seconds()
         unique_hashes = list(dict.fromkeys(hashes))
         placeholders = ",".join("?" for _ in unique_hashes)
         query = (
             "SELECT session_id, message_id, position, sha256, caption, "
-            "image_count, created_at FROM group_image_fingerprints "
-            f"WHERE sha256 IN ({placeholders})"
+            "image_count, first_seen, last_seen FROM group_image_fingerprints "
+            f"WHERE sha256 IN ({placeholders}) ORDER BY last_seen DESC"
         )
-        params = list(unique_hashes)
-        if ttl_seconds > 0:
-            query += " AND created_at >= ?"
-            params.append(time.time() - ttl_seconds)
-        query += " ORDER BY created_at DESC"
         async with aiosqlite.connect(self.caption_db_path) as db:
-            cursor = await db.execute(query, params)
+            cursor = await db.execute(query, unique_hashes)
             rows = await cursor.fetchall()
 
         candidates = {}
-        for session_id, message_id, position, sha256, caption, image_count, created_at in rows:
+        for session_id, message_id, position, sha256, caption, image_count, first_seen, last_seen in rows:
             key = (str(session_id), str(message_id))
             candidate = candidates.setdefault(
                 key,
                 {
+                    "key": key,
                     "hashes": [],
                     "caption": str(caption),
                     "image_count": int(image_count),
-                    "created_at": float(created_at),
+                    "first_seen": float(first_seen),
+                    "last_seen": float(last_seen),
                 },
             )
             candidate["hashes"].append((int(position), str(sha256)))
 
         current_counter = Counter(hashes)
+        matched = None
         for candidate in sorted(
             candidates.values(),
-            key=lambda item: item["created_at"],
+            key=lambda item: item["last_seen"],
             reverse=True,
         ):
             candidate_hashes = [
@@ -514,14 +507,58 @@ class SysSettingPortPlugin(Star):
             ]
             if len(hashes) == 1:
                 if candidate["image_count"] == 1 and candidate_hashes == hashes:
-                    return candidate["caption"]
+                    matched = candidate
+                    break
                 continue
-            overlap = sum(
-                (current_counter & Counter(candidate_hashes)).values()
-            )
+            overlap = sum((current_counter & Counter(candidate_hashes)).values())
             if candidate["image_count"] >= 2 and overlap >= 2:
-                return candidate["caption"]
-        return ""
+                matched = candidate
+                break
+        if not matched:
+            return ""
+
+        now = time.time()
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                await db.execute(
+                    "UPDATE group_image_fingerprints SET hit_count = hit_count + 1, "
+                    "last_seen = ? WHERE session_id = ? AND message_id = ?",
+                    (now, *matched["key"]),
+                )
+                await db.commit()
+        return matched["caption"]
+
+    async def _prune_image_fingerprints(self, db, now: float):
+        max_groups = max(1, int(self.config.get("image_fingerprint_cache_size", 100000)))
+        prune_groups = max(1, int(self.config.get("image_fingerprint_prune_count", 10000)))
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM group_image_fingerprints "
+            "GROUP BY session_id, message_id)"
+        )
+        group_count = int((await cursor.fetchone())[0])
+        if group_count <= max_groups:
+            return
+        delete_count = min(prune_groups, group_count)
+        cursor = await db.execute(
+            "SELECT session_id, message_id, MAX(hit_count) AS hits, "
+            "MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen "
+            "FROM group_image_fingerprints GROUP BY session_id, message_id"
+        )
+        groups = await cursor.fetchall()
+        groups.sort(
+            key=lambda row: (
+                float(row[2]) / max(1.0, (now - float(row[3])) / 86400.0),
+                float(row[4]),
+            )
+        )
+        await db.executemany(
+            "DELETE FROM group_image_fingerprints WHERE session_id = ? AND message_id = ?",
+            [(str(row[0]), str(row[1])) for row in groups[:delete_count]],
+        )
+        logger.info(
+            f"SHA-256 长期描述库已按热度淘汰: before={group_count}, "
+            f"deleted={delete_count}, limit={max_groups}"
+        )
 
     async def _save_image_fingerprints(
         self,
@@ -536,7 +573,6 @@ class SysSettingPortPlugin(Star):
             return
         await self._ensure_caption_db()
         now = time.time()
-        ttl_seconds = self._caption_cache_ttl_seconds()
         async with self.caption_db_lock:
             async with aiosqlite.connect(self.caption_db_path) as db:
                 await db.execute("PRAGMA busy_timeout=10000")
@@ -548,8 +584,9 @@ class SysSettingPortPlugin(Star):
                 await db.executemany(
                     """
                     INSERT INTO group_image_fingerprints
-                    (session_id, message_id, position, sha256, caption, image_count, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (session_id, message_id, position, sha256, caption, image_count,
+                     created_at, hit_count, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     [
                         (
@@ -560,15 +597,13 @@ class SysSettingPortPlugin(Star):
                             caption,
                             image_count,
                             now,
+                            now,
+                            now,
                         )
                         for position, sha256 in enumerate(hashes)
                     ],
                 )
-                if ttl_seconds > 0:
-                    await db.execute(
-                        "DELETE FROM group_image_fingerprints WHERE created_at < ?",
-                        (now - ttl_seconds,),
-                    )
+                await self._prune_image_fingerprints(db, now)
                 await db.commit()
 
     @staticmethod
@@ -823,13 +858,14 @@ class SysSettingPortPlugin(Star):
                     event.get_sender_name() or str(event.get_sender_id()),
                     str(event.get_sender_id()),
                 )
-                await self._save_image_fingerprints(
-                    cache_session_id,
-                    message_id,
-                    hashes,
-                    caption,
-                    len(images),
-                )
+                if not reused:
+                    await self._save_image_fingerprints(
+                        cache_session_id,
+                        message_id,
+                        hashes,
+                        caption,
+                        len(images),
+                    )
                 logger.info(
                     f"群聊静默图片描述已持久化: group={cache_session_id}, "
                     f"message={message_id}, images={len(images)}, reused={reused}"
@@ -1000,33 +1036,47 @@ class SysSettingPortPlugin(Star):
 
     @event_message_type(EventMessageType.ALL, priority=maxsize - 3)
     async def handle_strip_quote_image(self, event: AstrMessageEvent):
-        quote_images, quote_sources, quote_captions = [], [], []
+        quote_images, quote_sources, quote_captions, quote_records = [], [], [], []
         for comp in event.message_obj.message:
             if isinstance(comp, Reply) and comp.chain:
                 sender_name = (getattr(comp, "sender_nickname", None) or "未知用户").strip()
-                sender_id = getattr(comp, "sender_id", None)
-                source_label = f"{sender_name}（{sender_id}）" if sender_id and str(sender_id) not in sender_name else sender_name
-                if event.get_group_id():
-                    quote_captions.extend(
-                        await self._get_message_captions(
-                            self._group_cache_session_id(event),
-                            str(comp.id),
-                        )
+                sender_id = str(getattr(comp, "sender_id", None) or "")
+                source_label = f"{sender_name}（{sender_id}）" if sender_id and sender_id not in sender_name else sender_name
+                message_id = str(comp.id or "")
+                cached_captions = []
+                if event.get_group_id() and message_id:
+                    cached_captions = await self._get_message_captions(
+                        self._group_cache_session_id(event),
+                        message_id,
                     )
-                new_chain = []
+                    quote_captions.extend(cached_captions)
+                new_chain, record_images = [], []
                 for component in comp.chain:
                     if isinstance(component, Image):
                         quote_images.append(component)
+                        record_images.append(component)
                         quote_sources.append(source_label)
                     else:
                         new_chain.append(component)
                 comp.chain = new_chain
+                if record_images:
+                    quote_records.append(
+                        {
+                            "message_id": message_id,
+                            "sender_name": sender_name,
+                            "sender_id": sender_id,
+                            "source": source_label,
+                            "images": record_images,
+                            "captions": cached_captions,
+                        }
+                    )
         if quote_images:
             for image in quote_images:
                 event.message_obj.message.append(image)
             event.set_extra("sys_setting_port_quote_images", quote_images)
             event.set_extra("sys_setting_port_quote_sources", quote_sources)
             event.set_extra("sys_setting_port_quote_captions", quote_captions)
+            event.set_extra("sys_setting_port_quote_records", quote_records)
 
     @staticmethod
     def _match_target_model(req: ProviderRequest, provider, target_models: list) -> tuple[bool, str, list[str]]:
@@ -1407,8 +1457,9 @@ class SysSettingPortPlugin(Star):
         quote_sources = event.get_extra("sys_setting_port_quote_sources", [])
         quote_captions = list(event.get_extra("sys_setting_port_quote_captions", []))
         quote_images = event.get_extra("sys_setting_port_quote_images", [])
+        quote_records = list(event.get_extra("sys_setting_port_quote_records", []))
         quote_image_ids = {id(image) for image in quote_images}
-        quote_paths, current_paths = [], []
+        quote_paths, current_paths, resolved_paths = [], [], {}
 
         import re
         prepared_paths = list(req.image_urls or [])
@@ -1439,6 +1490,7 @@ class SysSettingPortPlugin(Star):
             )
             if not path:
                 continue
+            resolved_paths[id(component)] = path
             target_paths = quote_paths if id(component) in quote_image_ids else current_paths
             if path not in target_paths:
                 target_paths.append(path)
@@ -1460,13 +1512,19 @@ class SysSettingPortPlugin(Star):
                         caption = await self._caption_group_image(event, image)
                         if caption:
                             quote_captions.append(caption)
-                req.image_urls = current_paths
                 if quote_captions:
+                    req.image_urls = current_paths
                     caption_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
                     mode = self._inject_caption_text(event, req, caption_text)
                     logger.info(
                         f"【图片转述｜成功】provider=群聊图片描述缓存, mode={mode}, "
                         f"chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
+                    )
+                else:
+                    req.image_urls = [*current_paths, *quote_paths]
+                    logger.info(
+                        f"【引用图片｜多模态直通】缓存不存在，已向主模型保留原图: "
+                        f"images={len(quote_paths)}"
                     )
             return
 
@@ -1482,22 +1540,36 @@ class SysSettingPortPlugin(Star):
             )
             return
 
-        async def caption_batch(paths: list[str], kind: str, source: str = ""):
+        async def caption_batch(
+            paths: list[str],
+            kind: str,
+            source: str = "",
+            quote_record: dict | None = None,
+        ):
             if not paths:
                 return
+            hashes = await self._hash_image_paths(paths)
+            caption = await self._find_reusable_image_caption(hashes)
+            reused = bool(caption)
             caption_provider = self.context.get_provider_by_id(caption_provider_id)
-            logger.info(
-                f"【图片转述｜触发】kind={kind}, 目标关键词={matched_keyword}, "
-                f"current_models={model_candidates}, caption_provider="
-                f"{self._provider_log_name(caption_provider_id, caption_provider)}, images={len(paths)}"
-            )
-            caption = await self._try_caption(
-                caption_provider_id,
-                caption_prompt,
-                paths,
-                max_retries,
-                caption_timeout_seconds,
-            )
+            if reused:
+                logger.info(
+                    f"【图片转述｜SHA-256 复用】kind={kind}, images={len(paths)}, "
+                    f"hashed={len(hashes)}"
+                )
+            else:
+                logger.info(
+                    f"【图片转述｜触发】kind={kind}, 目标关键词={matched_keyword}, "
+                    f"current_models={model_candidates}, caption_provider="
+                    f"{self._provider_log_name(caption_provider_id, caption_provider)}, images={len(paths)}"
+                )
+                caption = await self._try_caption(
+                    caption_provider_id,
+                    caption_prompt,
+                    paths,
+                    max_retries,
+                    caption_timeout_seconds,
+                )
             used_provider_id, used_provider = caption_provider_id, caption_provider
             if not caption and fallback_provider_id:
                 fallback_provider = self.context.get_provider_by_id(fallback_provider_id)
@@ -1522,6 +1594,42 @@ class SysSettingPortPlugin(Star):
             source_note = f"（来自被引用消息的 {source}，不是当前发言者）" if source else "（当前消息图片）"
             caption_text = f"[图片转述内容]{source_note}: {caption}"
             mode = self._inject_caption_text(event, req, caption_text)
+            cache_session_id = self._group_cache_session_id(event)
+            message_id = ""
+            sender_name = ""
+            sender_id = ""
+            image_key = ""
+            if quote_record and event.get_group_id() and quote_record.get("message_id"):
+                message_id = str(quote_record["message_id"])
+                sender_name = str(quote_record.get("sender_name") or "未知用户")
+                sender_id = str(quote_record.get("sender_id") or "")
+                image_key = "text_model_quote_bundle"
+            elif event.get_group_id() and kind == "current":
+                message_id = str(event.message_obj.message_id or "")
+                sender_name = event.get_sender_name() or str(event.get_sender_id())
+                sender_id = str(event.get_sender_id())
+                image_key = "text_model_current_bundle"
+            if message_id:
+                await self._save_message_captions(
+                    cache_session_id,
+                    message_id,
+                    [(image_key, caption)],
+                    sender_name,
+                    sender_id,
+                )
+                if hashes and not reused:
+                    await self._save_image_fingerprints(
+                        cache_session_id,
+                        message_id,
+                        hashes,
+                        caption,
+                        len(paths),
+                    )
+                logger.info(
+                    f"【图片转述｜消息描述已持久化】group={cache_session_id}, "
+                    f"message={message_id}, kind={kind}, images={len(paths)}, "
+                    f"reused={reused}"
+                )
             logger.info(
                 f"【图片转述｜成功】kind={kind}, provider="
                 f"{self._provider_log_name(used_provider_id, used_provider)}, "
@@ -1532,7 +1640,36 @@ class SysSettingPortPlugin(Star):
             keyword and keyword in (req.prompt or "")
             for keyword in inspect_keywords
         )
-        if quote_captions and not force_quote_reinspect:
+        if quote_records:
+            for record in quote_records:
+                record_paths = list(
+                    dict.fromkeys(
+                        resolved_paths[id(image)]
+                        for image in record.get("images", [])
+                        if id(image) in resolved_paths
+                    )
+                )
+                record_captions = list(record.get("captions", []))
+                if record_captions and not force_quote_reinspect:
+                    cached_text = (
+                        f"[被引用图片的既有描述（来自 {record.get('source') or '原发送者'}）]: "
+                        f"{'；'.join(record_captions)}"
+                    )
+                    mode = self._inject_caption_text(event, req, cached_text)
+                    logger.info(
+                        f"【图片转述｜成功】kind=quoted_cached, provider=群聊图片描述缓存, "
+                        f"mode={mode}, chars={len('；'.join(record_captions))}, "
+                        f"images={len(record_paths)}"
+                    )
+                    continue
+                quote_kind = "quoted_reinspect" if force_quote_reinspect else "quoted_uncached"
+                await caption_batch(
+                    record_paths,
+                    quote_kind,
+                    str(record.get("source") or "原发送者"),
+                    record,
+                )
+        elif quote_captions and not force_quote_reinspect:
             cached_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
             mode = self._inject_caption_text(event, req, cached_text)
             logger.info(

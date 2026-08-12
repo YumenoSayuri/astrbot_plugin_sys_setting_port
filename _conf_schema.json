@@ -153,16 +153,22 @@
         "default": 80
     },
     "group_visual_cache_ttl_hours": {
-        "description": "图片描述过期时间 (小时)",
-        "hint": "默认 8 小时。超过后缓存不再用于群聊历史或引用图片；填写 0 表示永不过期。",
+        "description": "消息 ID 图片描述保留时间 (小时)",
+        "hint": "用于 NapCat 历史和引用消息按消息 ID 快速查找描述，默认保留 24 小时，不设条数上限；填写 0 表示永不过期。此设置不影响独立的 SHA-256 长期描述库。",
         "type": "int",
-        "default": 8
+        "default": 24
     },
-    "group_visual_cache_size": {
-        "description": "每群图片消息缓存上限",
-        "hint": "每个群最多持久化多少条图片消息的描述，默认 100；一条多图消息只计一条，超过后删除该群最旧图片消息。",
+    "image_fingerprint_cache_size": {
+        "description": "SHA-256 长期描述库全局上限",
+        "hint": "全局最多保留多少组不同图片或联合图片描述，默认 100000。SHA 库不按时间过期，命中时累计次数；只有超出上限时才按命中频率与存活天数评分淘汰。",
         "type": "int",
-        "default": 100
+        "default": 100000
+    },
+    "image_fingerprint_prune_count": {
+        "description": "SHA-256 超限批量淘汰组数",
+        "hint": "SHA 长期库超过全局上限时，一次删除评分最低的多少组，默认 10000，避免每新增一组都重复执行全库排序。",
+        "type": "int",
+        "default": 10000
     },
     "quote_image_inspect_keywords": {
         "description": "引用图片重新查看关键词",
