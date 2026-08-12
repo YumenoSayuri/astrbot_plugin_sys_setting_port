@@ -134,6 +134,12 @@
         "_special": "select_provider",
         "default": ""
     },
+    "group_visual_llm_timeout_seconds": {
+        "description": "群聊图片感知 LLM 单次超时 (秒)",
+        "hint": "群聊静默图片感知每次调用视觉模型允许等待的最长时间，默认 120 秒。每次重试独立计算此时限。",
+        "type": "int",
+        "default": 120
+    },
     "group_visual_prompt": {
         "description": "群聊图片理解提示词",
         "hint": "用于生成可供后续群聊理解的图片描述。",
@@ -170,6 +176,12 @@
         "type": "string",
         "_special": "select_provider",
         "default": ""
+    },
+    "caption_llm_timeout_seconds": {
+        "description": "多模态转述 LLM 单次超时 (秒)",
+        "hint": "文本模型看图转述时，主力与兜底转述模型每次请求允许等待的最长时间，默认 90 秒。每次重试独立计算此时限。",
+        "type": "int",
+        "default": 90
     },
     "fallback_provider_id": {
         "description": "兜底次选转述模型",
@@ -208,6 +220,12 @@
         "type": "string",
         "_special": "select_provider",
         "default": ""
+    },
+    "caption_judge_timeout_seconds": {
+        "description": "转述质量判定 LLM 单次超时 (秒)",
+        "hint": "每次调用质量判定模型允许等待的最长时间，默认 30 秒。判定超时会按本轮转述失败处理并进入既有重试逻辑。",
+        "type": "int",
+        "default": 30
     },
     "caption_judge_prompt": {
         "description": "转述判定提示词",

@@ -1,5 +1,5 @@
 name: astrbot_plugin_sys_setting_port
 author: Nova
-version: 2.2.7
-description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。看门狗按每轮工具进展刷新，最终响应到达后解除。
+version: 2.2.8
+description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。支持分别配置群聊感知、图片转述和质量判定 LLM 超时。
 repo: https://github.com/YumenoSayuri/astrbot_plugin_sys_setting_port

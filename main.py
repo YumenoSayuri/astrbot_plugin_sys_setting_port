@@ -25,7 +25,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.7", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.8", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -616,6 +616,10 @@ class SysSettingPortPlugin(Star):
         if len(images) > 1:
             prompt += f"\n本条消息包含 {len(images)} 张图片，请按图片顺序给出一份联合描述并说明它们之间的关系。"
         max_retries = max(1, int(self.config.get("max_retries", 3)))
+        timeout_seconds = max(
+            1,
+            int(self.config.get("group_visual_llm_timeout_seconds", 120)),
+        )
         try:
             if paths is None:
                 paths = await self._resolve_group_image_paths(event, images)
@@ -624,7 +628,13 @@ class SysSettingPortPlugin(Star):
                     f"群聊图片理解已取消: images={len(images)}，没有可发送的有效图片"
                 )
                 return ""
-            return await self._try_caption(provider_id, prompt, paths, max_retries)
+            return await self._try_caption(
+                provider_id,
+                prompt,
+                paths,
+                max_retries,
+                timeout_seconds,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1226,7 +1236,14 @@ class SysSettingPortPlugin(Star):
         )
         return ""
 
-    async def _try_caption(self, provider_id: str, prompt: str, image_urls: list, max_retries: int) -> str:
+    async def _try_caption(
+        self,
+        provider_id: str,
+        prompt: str,
+        image_urls: list,
+        max_retries: int,
+        timeout_seconds: int | None = None,
+    ) -> str:
         invalid_payloads = [
             self._describe_image_path(path)
             for path in image_urls
@@ -1242,6 +1259,18 @@ class SysSettingPortPlugin(Star):
         if not prov:
             logger.error(f"【图片转述｜调用失败】未找到 Provider: {provider_id}")
             return ""
+        timeout_seconds = max(
+            1,
+            int(
+                timeout_seconds
+                if timeout_seconds is not None
+                else self.config.get("caption_llm_timeout_seconds", 90)
+            ),
+        )
+        judge_timeout_seconds = max(
+            1,
+            int(self.config.get("caption_judge_timeout_seconds", 30)),
+        )
         structured_enabled = self.config.get("enable_caption_structured", True)
         judge_enabled, judge_provider_id, judge_prompt_tmpl = self.config.get("enable_caption_judge", False), self.config.get("caption_judge_provider_id", ""), self.config.get("caption_judge_prompt", "")
         if structured_enabled: prompt += "\n请务必将最终的图片描述内容包裹在 <caption_result> 标签中。如果无法描述，请输出 <error>原因</error>。"
@@ -1249,7 +1278,8 @@ class SysSettingPortPlugin(Star):
             try:
                 logger.info(
                     f"【图片转述｜调用 Provider】provider={self._provider_log_name(provider_id, prov)}, "
-                    f"attempt={attempt + 1}/{max_retries}, images={len(image_urls)}, "
+                    f"attempt={attempt + 1}/{max_retries}, timeout={timeout_seconds}s, "
+                    f"images={len(image_urls)}, "
                     f"payload={[self._describe_image_path(path) for path in image_urls]}"
                 )
                 resp = await asyncio.wait_for(
@@ -1258,7 +1288,7 @@ class SysSettingPortPlugin(Star):
                         prompt="[图片]",
                         image_urls=image_urls,
                     ),
-                    timeout=45.0,
+                    timeout=timeout_seconds,
                 )
                 if not resp or not resp.completion_text:
                     logger.warning(
@@ -1287,7 +1317,17 @@ class SysSettingPortPlugin(Star):
                 if judge_enabled and judge_provider_id and judge_prompt_tmpl:
                     judge_prov = self.context.get_provider_by_id(judge_provider_id)
                     if judge_prov:
-                        j_resp = await asyncio.wait_for(judge_prov.text_chat(prompt=judge_prompt_tmpl.replace("{{caption}}", caption)), timeout=20.0)
+                        logger.info(
+                            f"【图片转述｜调用质量判定】provider="
+                            f"{self._provider_log_name(judge_provider_id, judge_prov)}, "
+                            f"timeout={judge_timeout_seconds}s"
+                        )
+                        j_resp = await asyncio.wait_for(
+                            judge_prov.text_chat(
+                                prompt=judge_prompt_tmpl.replace("{{caption}}", caption)
+                            ),
+                            timeout=judge_timeout_seconds,
+                        )
                         if j_resp and j_resp.completion_text and "否" in j_resp.completion_text.strip():
                             logger.warning(
                                 f"【图片转述｜判定未通过】provider="
@@ -1357,6 +1397,10 @@ class SysSettingPortPlugin(Star):
         target_models = self.config.get("target_models", [])
         caption_prompt = self.config.get("caption_prompt", "请详细描述这张图片的内容，以便纯文本模型能够理解。")
         max_retries = int(self.config.get("max_retries", 3))
+        caption_timeout_seconds = max(
+            1,
+            int(self.config.get("caption_llm_timeout_seconds", 90)),
+        )
         curr_prov = self.context.get_using_provider(event.unified_msg_origin)
         is_target_text_model, matched_keyword, model_candidates = self._match_target_model(req, curr_prov, target_models)
 
@@ -1447,7 +1491,13 @@ class SysSettingPortPlugin(Star):
                 f"current_models={model_candidates}, caption_provider="
                 f"{self._provider_log_name(caption_provider_id, caption_provider)}, images={len(paths)}"
             )
-            caption = await self._try_caption(caption_provider_id, caption_prompt, paths, max_retries)
+            caption = await self._try_caption(
+                caption_provider_id,
+                caption_prompt,
+                paths,
+                max_retries,
+                caption_timeout_seconds,
+            )
             used_provider_id, used_provider = caption_provider_id, caption_provider
             if not caption and fallback_provider_id:
                 fallback_provider = self.context.get_provider_by_id(fallback_provider_id)
@@ -1455,7 +1505,13 @@ class SysSettingPortPlugin(Star):
                     f"【图片转述｜主模型失败】kind={kind}, 准备调用兜底模型 "
                     f"{self._provider_log_name(fallback_provider_id, fallback_provider)}"
                 )
-                caption = await self._try_caption(fallback_provider_id, caption_prompt, paths, max_retries)
+                caption = await self._try_caption(
+                    fallback_provider_id,
+                    caption_prompt,
+                    paths,
+                    max_retries,
+                    caption_timeout_seconds,
+                )
                 used_provider_id, used_provider = fallback_provider_id, fallback_provider
             if not caption:
                 logger.error(
