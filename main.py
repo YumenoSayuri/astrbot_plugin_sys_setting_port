@@ -13,14 +13,19 @@ from astrbot.api.all import *
 from astrbot.core.message.components import Image, Reply, At, Plain
 from astrbot.core.agent.message import Message, TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
-from astrbot.api.event.filter import on_llm_request
-from astrbot.core.provider.entities import ProviderRequest
+from astrbot.api.event.filter import (
+    on_llm_request,
+    on_llm_response,
+    on_using_llm_tool,
+    on_llm_tool_respond,
+)
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.5", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.7", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -66,20 +71,29 @@ class SysSettingPortPlugin(Star):
                 watchdog_task.cancel()
         self.request_watchdogs.clear()
 
-    def _finish_request_watchdog(self, session_id: str, token: int):
+    def _finish_request_watchdog(
+        self,
+        session_id: str,
+        token: int,
+        finish_reason: str = "pipeline_done",
+    ) -> bool:
         entry = self.request_watchdogs.get(session_id)
         if not entry or entry.get("token") != token:
-            return
+            return False
         self.request_watchdogs.pop(session_id, None)
         watchdog_task = entry.get("watchdog_task")
         if not entry.get("timed_out") and watchdog_task and not watchdog_task.done():
             watchdog_task.cancel()
+        entry["finish_reason"] = finish_reason
+        entry["finished_at"] = time.monotonic()
+        return True
 
     async def _request_timeout_watchdog(
         self,
         event: AstrMessageEvent,
         session_id: str,
         token: int,
+        generation: int,
         pipeline_task: asyncio.Task,
         timeout_seconds: int,
     ):
@@ -89,16 +103,21 @@ class SysSettingPortPlugin(Star):
             if (
                 not entry
                 or entry.get("token") != token
+                or entry.get("generation") != generation
                 or entry.get("pipeline_task") is not pipeline_task
                 or pipeline_task.done()
             ):
                 return
 
             entry["timed_out"] = True
-            elapsed = time.monotonic() - entry["started_at"]
+            now = time.monotonic()
+            total_elapsed = now - entry["started_at"]
+            idle_elapsed = now - entry["last_refreshed_at"]
             logger.error(
                 f"【会话请求超时｜强制终止】session={session_id}, token={token}, "
-                f"limit={timeout_seconds}s, elapsed={elapsed:.1f}s；正在取消当前请求并释放会话锁"
+                f"generation={generation}, phase={entry.get('phase')}, "
+                f"limit={timeout_seconds}s, idle={idle_elapsed:.1f}s, "
+                f"total={total_elapsed:.1f}s；正在取消当前请求并释放会话锁"
             )
             event.set_extra("sys_setting_port_request_timed_out", True)
             pipeline_task.cancel()
@@ -120,6 +139,49 @@ class SysSettingPortPlugin(Star):
                         logger.warning(f"会话请求超时提示发送失败: {e}")
         except asyncio.CancelledError:
             return
+
+    def _refresh_request_watchdog(
+        self,
+        event: AstrMessageEvent,
+        phase: str,
+    ) -> bool:
+        token = event.get_extra("sys_setting_port_request_watchdog_token", None)
+        if token is None:
+            return False
+        session_id = event.unified_msg_origin
+        entry = self.request_watchdogs.get(session_id)
+        if (
+            not entry
+            or entry.get("token") != token
+            or entry.get("timed_out")
+            or entry["pipeline_task"].done()
+        ):
+            return False
+
+        old_task = entry.get("watchdog_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        entry["generation"] += 1
+        entry["refresh_count"] += 1
+        entry["phase"] = phase
+        entry["last_refreshed_at"] = time.monotonic()
+        generation = entry["generation"]
+        entry["watchdog_task"] = asyncio.create_task(
+            self._request_timeout_watchdog(
+                event,
+                session_id,
+                token,
+                generation,
+                entry["pipeline_task"],
+                entry["timeout_seconds"],
+            )
+        )
+        logger.info(
+            f"【会话请求看门狗｜已刷新】session={session_id}, token={token}, "
+            f"generation={generation}, refresh={entry['refresh_count']}, "
+            f"phase={phase}, limit={entry['timeout_seconds']}s"
+        )
+        return True
 
     @on_llm_request(priority=maxsize)
     async def register_request_timeout_watchdog(
@@ -147,30 +209,82 @@ class SysSettingPortPlugin(Star):
 
         self.request_watchdog_sequence += 1
         token = self.request_watchdog_sequence
+        started_at = time.monotonic()
         entry = {
             "token": token,
             "pipeline_task": pipeline_task,
             "watchdog_task": None,
-            "started_at": time.monotonic(),
+            "started_at": started_at,
+            "last_refreshed_at": started_at,
+            "timeout_seconds": timeout_seconds,
+            "generation": 1,
+            "refresh_count": 0,
+            "phase": "waiting_initial_llm",
             "timed_out": False,
         }
         self.request_watchdogs[session_id] = entry
+        event.set_extra("sys_setting_port_request_watchdog_token", token)
         watchdog_task = asyncio.create_task(
             self._request_timeout_watchdog(
                 event,
                 session_id,
                 token,
+                entry["generation"],
                 pipeline_task,
                 timeout_seconds,
             )
         )
         entry["watchdog_task"] = watchdog_task
         pipeline_task.add_done_callback(
-            lambda _task, sid=session_id, tok=token: self._finish_request_watchdog(sid, tok)
+            lambda _task, sid=session_id, tok=token: self._finish_request_watchdog(
+                sid,
+                tok,
+                "pipeline_done",
+            )
         )
         logger.info(
-            f"【会话请求看门狗｜已启动】session={session_id}, token={token}, limit={timeout_seconds}s"
+            f"【会话请求看门狗｜已启动】session={session_id}, token={token}, "
+            f"generation=1, limit={timeout_seconds}s, phase=waiting_initial_llm"
         )
+
+    @on_using_llm_tool(priority=maxsize)
+    async def refresh_request_watchdog_on_tool_start(
+        self,
+        event: AstrMessageEvent,
+        tool,
+        tool_args: dict | None,
+    ):
+        self._refresh_request_watchdog(event, "tool_started")
+
+    @on_llm_tool_respond(priority=maxsize)
+    async def refresh_request_watchdog_on_tool_end(
+        self,
+        event: AstrMessageEvent,
+        tool,
+        tool_args: dict | None,
+        tool_result,
+    ):
+        self._refresh_request_watchdog(event, "waiting_next_llm")
+
+    @on_llm_response(priority=maxsize)
+    async def finish_request_watchdog_on_llm_response(
+        self,
+        event: AstrMessageEvent,
+        response: LLMResponse,
+    ):
+        token = event.get_extra("sys_setting_port_request_watchdog_token", None)
+        if token is None:
+            return
+        session_id = event.unified_msg_origin
+        entry = self.request_watchdogs.get(session_id)
+        if not entry or entry.get("token") != token:
+            return
+        elapsed = time.monotonic() - entry["started_at"]
+        if self._finish_request_watchdog(session_id, token, "llm_response"):
+            logger.info(
+                f"【会话请求看门狗｜已解除】session={session_id}, token={token}, "
+                f"elapsed={elapsed:.1f}s, reason=first_final_llm_response"
+            )
 
     def _group_context_enabled(self, event: AstrMessageEvent) -> bool:
         return bool(self.config.get("enable_group_visual_context", False) and event.get_group_id())

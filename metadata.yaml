@@ -1,5 +1,5 @@
 name: astrbot_plugin_sys_setting_port
 author: Nova
-version: 2.2.5
-description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。新增基于 SHA-256 的重复图片描述复用。
+version: 2.2.7
+description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、多模态转述与自定义等待。看门狗按每轮工具进展刷新，最终响应到达后解除。
 repo: https://github.com/YumenoSayuri/astrbot_plugin_sys_setting_port
