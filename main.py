@@ -11,7 +11,7 @@ import aiosqlite
 
 from astrbot.api.all import *
 from astrbot.core.message.components import Image, Reply, At, Plain
-from astrbot.core.agent.message import Message, TextPart
+from astrbot.core.agent.message import ImageURLPart, Message, TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 from astrbot.api.event.filter import (
     on_llm_request,
@@ -25,7 +25,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.9", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.10", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -527,6 +527,73 @@ class SysSettingPortPlugin(Star):
                 )
                 await db.commit()
         return matched["caption"]
+
+    async def _replace_image_fingerprint_caption(
+        self,
+        hashes: list[str],
+        caption: str,
+    ) -> bool:
+        caption = str(caption).strip()
+        if not hashes or not caption:
+            return False
+        await self._ensure_caption_db()
+        unique_hashes = list(dict.fromkeys(hashes))
+        placeholders = ",".join("?" for _ in unique_hashes)
+        query = (
+            "SELECT session_id, message_id, position, sha256, image_count, last_seen "
+            "FROM group_image_fingerprints "
+            f"WHERE sha256 IN ({placeholders}) ORDER BY last_seen DESC"
+        )
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                cursor = await db.execute(query, unique_hashes)
+                rows = await cursor.fetchall()
+                candidates = {}
+                for session_id, message_id, position, sha256, image_count, last_seen in rows:
+                    key = (str(session_id), str(message_id))
+                    candidate = candidates.setdefault(
+                        key,
+                        {
+                            "key": key,
+                            "hashes": [],
+                            "image_count": int(image_count),
+                            "last_seen": float(last_seen),
+                        },
+                    )
+                    candidate["hashes"].append((int(position), str(sha256)))
+
+                current_counter = Counter(hashes)
+                matched = None
+                for candidate in sorted(
+                    candidates.values(),
+                    key=lambda item: item["last_seen"],
+                    reverse=True,
+                ):
+                    candidate_hashes = [
+                        sha256 for _, sha256 in sorted(candidate["hashes"])
+                    ]
+                    if len(hashes) == 1:
+                        if candidate["image_count"] == 1 and candidate_hashes == hashes:
+                            matched = candidate
+                            break
+                        continue
+                    overlap = sum(
+                        (current_counter & Counter(candidate_hashes)).values()
+                    )
+                    if candidate["image_count"] >= 2 and overlap >= 2:
+                        matched = candidate
+                        break
+                if not matched:
+                    return False
+
+                await db.execute(
+                    "UPDATE group_image_fingerprints SET caption = ?, "
+                    "hit_count = hit_count + 1, last_seen = ? "
+                    "WHERE session_id = ? AND message_id = ?",
+                    (caption, time.time(), *matched["key"]),
+                )
+                await db.commit()
+        return True
 
     async def _prune_image_fingerprints(self, db, now: float):
         max_groups = max(1, int(self.config.get("image_fingerprint_cache_size", 100000)))
@@ -1043,6 +1110,7 @@ class SysSettingPortPlugin(Star):
                 sender_id = str(getattr(comp, "sender_id", None) or "")
                 source_label = f"{sender_name}（{sender_id}）" if sender_id and sender_id not in sender_name else sender_name
                 message_id = str(comp.id or "")
+                original_message_str = str(comp.message_str or "").strip()
                 cached_captions = []
                 if event.get_group_id() and message_id:
                     cached_captions = await self._get_message_captions(
@@ -1060,12 +1128,19 @@ class SysSettingPortPlugin(Star):
                         new_chain.append(component)
                 comp.chain = new_chain
                 if record_images:
+                    if cached_captions:
+                        image_text = f"[图片：{'；'.join(cached_captions)}]"
+                        comp.message_str = " ".join(
+                            part for part in (original_message_str, image_text) if part
+                        )
+                        comp.text = comp.message_str
                     quote_records.append(
                         {
                             "message_id": message_id,
                             "sender_name": sender_name,
                             "sender_id": sender_id,
                             "source": source_label,
+                            "message_str": original_message_str,
                             "images": record_images,
                             "captions": cached_captions,
                         }
@@ -1111,17 +1186,96 @@ class SysSettingPortPlugin(Star):
         return f"{provider_id} ({model})" if model else provider_id
 
     @staticmethod
-    def _inject_caption_text(event: AstrMessageEvent, req: ProviderRequest, caption_text: str) -> str:
+    def _inject_caption_text(
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        caption_text: str,
+        quote_record: dict | None = None,
+    ) -> str:
         if event.is_private_chat():
             if req.extra_user_content_parts is None:
                 req.extra_user_content_parts = []
             req.extra_user_content_parts.append(TextPart(text=f"\n{caption_text}"))
             return "private_persistent_user_content"
         pending = list(event.get_extra("sys_setting_port_pending_captions", []))
-        if caption_text not in pending:
-            pending.append(caption_text)
+        item = {
+            "kind": "quoted" if quote_record else "current",
+            "caption": caption_text,
+        }
+        if quote_record:
+            item.update(
+                {
+                    "message_id": str(quote_record.get("message_id") or ""),
+                    "original_sender_name": str(
+                        quote_record.get("sender_name") or "未知用户"
+                    ),
+                    "original_sender_id": str(quote_record.get("sender_id") or ""),
+                    "quoting_sender_name": event.get_sender_name()
+                    or str(event.get_sender_id()),
+                    "quoting_sender_id": str(event.get_sender_id()),
+                }
+            )
+        if item not in pending:
+            pending.append(item)
         event.set_extra("sys_setting_port_pending_captions", pending)
-        return "group_pending_temporary_context"
+        return "group_pending_quoted_context" if quote_record else "group_pending_current_context"
+
+    @staticmethod
+    def _find_native_quote_part_index(req: ProviderRequest) -> int:
+        for index, part in enumerate(req.extra_user_content_parts or []):
+            if isinstance(part, TextPart) and "<Quoted Message>" in part.text:
+                return index
+        return -1
+
+    @classmethod
+    def _replace_quoted_message_text(
+        cls,
+        req: ProviderRequest,
+        quote_record: dict,
+        caption: str,
+    ) -> bool:
+        index = cls._find_native_quote_part_index(req)
+        if index < 0:
+            return False
+        sender_name = str(quote_record.get("sender_name") or "未知用户")
+        original_text = str(quote_record.get("message_str") or "").strip()
+        image_text = f"[图片：{caption}]"
+        quoted_body = " ".join(part for part in (original_text, image_text) if part)
+        req.extra_user_content_parts[index] = TextPart(
+            text=f"<Quoted Message>\n({sender_name}): {quoted_body}\n</Quoted Message>"
+        )
+        return True
+
+    @classmethod
+    def _embed_images_in_quoted_message(
+        cls,
+        req: ProviderRequest,
+        quote_record: dict,
+        image_paths: list[str],
+    ) -> bool:
+        index = cls._find_native_quote_part_index(req)
+        if index < 0 or not image_paths:
+            return False
+        sender_name = str(quote_record.get("sender_name") or "未知用户")
+        message_id = str(quote_record.get("message_id") or "unknown")
+        original_text = str(quote_record.get("message_str") or "").strip()
+        opening_body = f"({sender_name}):"
+        if original_text:
+            opening_body += f" {original_text}"
+        opening_body += "\n[该历史消息中的图片如下]"
+        replacement_parts = [TextPart(text=f"<Quoted Message>\n{opening_body}")]
+        replacement_parts.extend(
+            ImageURLPart(
+                image_url=ImageURLPart.ImageURL(
+                    url=path,
+                    id=f"quoted:{message_id}:{position}",
+                )
+            )
+            for position, path in enumerate(image_paths)
+        )
+        replacement_parts.append(TextPart(text="\n</Quoted Message>"))
+        req.extra_user_content_parts[index:index + 1] = replacement_parts
+        return True
 
     @staticmethod
     def _inject_temporary_user_context(req: ProviderRequest, text: str) -> int:
@@ -1430,14 +1584,33 @@ class SysSettingPortPlugin(Star):
                 logger.debug(f"群聊上下文无可注入历史: group={group_id}")
 
         pending_captions = event.get_extra("sys_setting_port_pending_captions", [])
-        for caption_text in pending_captions:
-            position = self._inject_temporary_user_context(
-                req,
-                f"<current_image_caption>\n{caption_text}\n</current_image_caption>",
-            )
+        for item in pending_captions:
+            if isinstance(item, str):
+                item = {"kind": "current", "caption": item}
+            caption_text = str(item.get("caption") or "")
+            if not caption_text:
+                continue
+            if item.get("kind") == "quoted":
+                context_text = (
+                    "<quoted_image_ownership>\n"
+                    f"<original_message_id>{item.get('message_id') or '未知'}</original_message_id>\n"
+                    f"<original_sender_name>{item.get('original_sender_name') or '未知用户'}</original_sender_name>\n"
+                    f"<original_sender_id>{item.get('original_sender_id') or '未知'}</original_sender_id>\n"
+                    f"<quoting_sender_name>{item.get('quoting_sender_name') or '未知用户'}</quoting_sender_name>\n"
+                    f"<quoting_sender_id>{item.get('quoting_sender_id') or '未知'}</quoting_sender_id>\n"
+                    "<ownership_rule>随本轮请求附带的引用原图属于 original_sender；quoting_sender 只引用了该历史消息，并非图片发送者。</ownership_rule>\n"
+                    "</quoted_image_ownership>"
+                )
+                context_kind = "quoted_ownership"
+            else:
+                context_text = (
+                    f"<current_image_caption>\n{caption_text}\n</current_image_caption>"
+                )
+                context_kind = "current"
+            position = self._inject_temporary_user_context(req, context_text)
             logger.info(
-                f"【图片转述｜最终注入】group={group_id}, mode=temporary_context, "
-                f"position={position}, chars={len(caption_text)}"
+                f"【图片转述｜最终注入】group={group_id}, kind={context_kind}, "
+                f"mode=temporary_context, position={position}, chars={len(caption_text)}"
             )
 
     @on_llm_request()
@@ -1506,26 +1679,40 @@ class SysSettingPortPlugin(Star):
         )
 
         if not is_target_text_model:
-            if quote_paths and not wants_original:
-                if not quote_captions and self._visual_group_enabled(event) and self.config.get("group_visual_provider_id"):
-                    for image in quote_images:
-                        caption = await self._caption_group_image(event, image)
-                        if caption:
-                            quote_captions.append(caption)
-                if quote_captions:
-                    req.image_urls = current_paths
-                    caption_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
-                    mode = self._inject_caption_text(event, req, caption_text)
-                    logger.info(
-                        f"【图片转述｜成功】provider=群聊图片描述缓存, mode={mode}, "
-                        f"chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
+            if quote_paths and not wants_original and not quote_captions and self._visual_group_enabled(event) and self.config.get("group_visual_provider_id"):
+                for image in quote_images:
+                    caption = await self._caption_group_image(event, image)
+                    if caption:
+                        quote_captions.append(caption)
+            if quote_paths and quote_captions and not wants_original:
+                req.image_urls = current_paths
+                logger.info(
+                    f"【图片转述｜成功】provider=群聊图片描述缓存, "
+                    f"mode=quoted_message_native_cache, "
+                    f"chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
+                )
+            elif quote_paths:
+                req.image_urls = current_paths
+                embedded_count = 0
+                for record in quote_records:
+                    record_paths = list(
+                        dict.fromkeys(
+                            resolved_paths[id(image)]
+                            for image in record.get("images", [])
+                            if id(image) in resolved_paths
+                        )
                     )
-                else:
-                    req.image_urls = [*current_paths, *quote_paths]
-                    logger.info(
-                        f"【引用图片｜多模态直通】缓存不存在，已向主模型保留原图: "
-                        f"images={len(quote_paths)}"
-                    )
+                    if self._embed_images_in_quoted_message(req, record, record_paths):
+                        embedded_count += len(record_paths)
+                if embedded_count < len(quote_paths):
+                    fallback_paths = quote_paths[embedded_count:]
+                    req.image_urls = [*current_paths, *fallback_paths]
+                    for record in quote_records:
+                        self._inject_caption_text(event, req, "原图直通", record)
+                logger.info(
+                    f"【引用图片｜多模态直通】引用原图已嵌入原生引用结构: "
+                    f"embedded={embedded_count}, fallback={len(quote_paths) - embedded_count}"
+                )
             return
 
         req.image_urls = []
@@ -1549,7 +1736,12 @@ class SysSettingPortPlugin(Star):
             if not paths:
                 return
             hashes = await self._hash_image_paths(paths)
-            caption = await self._find_reusable_image_caption(hashes)
+            force_reinspect = kind == "quoted_reinspect"
+            caption = (
+                ""
+                if force_reinspect
+                else await self._find_reusable_image_caption(hashes)
+            )
             reused = bool(caption)
             caption_provider = self.context.get_provider_by_id(caption_provider_id)
             if reused:
@@ -1591,9 +1783,20 @@ class SysSettingPortPlugin(Star):
                     f"target={matched_keyword}, images={len(paths)}"
                 )
                 return
-            source_note = f"（来自被引用消息的 {source}，不是当前发言者）" if source else "（当前消息图片）"
-            caption_text = f"[图片转述内容]{source_note}: {caption}"
-            mode = self._inject_caption_text(event, req, caption_text)
+            caption_text = caption
+            if quote_record and not event.is_private_chat():
+                replaced = self._replace_quoted_message_text(
+                    req,
+                    quote_record,
+                    caption_text,
+                )
+                mode = (
+                    "quoted_message_replaced"
+                    if replaced
+                    else self._inject_caption_text(event, req, caption_text, quote_record)
+                )
+            else:
+                mode = self._inject_caption_text(event, req, caption_text)
             cache_session_id = self._group_cache_session_id(event)
             message_id = ""
             sender_name = ""
@@ -1618,13 +1821,20 @@ class SysSettingPortPlugin(Star):
                     sender_id,
                 )
                 if hashes and not reused:
-                    await self._save_image_fingerprints(
-                        cache_session_id,
-                        message_id,
-                        hashes,
-                        caption,
-                        len(paths),
-                    )
+                    fingerprint_replaced = False
+                    if force_reinspect:
+                        fingerprint_replaced = await self._replace_image_fingerprint_caption(
+                            hashes,
+                            caption,
+                        )
+                    if not fingerprint_replaced:
+                        await self._save_image_fingerprints(
+                            cache_session_id,
+                            message_id,
+                            hashes,
+                            caption,
+                            len(paths),
+                        )
                 logger.info(
                     f"【图片转述｜消息描述已持久化】group={cache_session_id}, "
                     f"message={message_id}, kind={kind}, images={len(paths)}, "
@@ -1651,11 +1861,8 @@ class SysSettingPortPlugin(Star):
                 )
                 record_captions = list(record.get("captions", []))
                 if record_captions and not force_quote_reinspect:
-                    cached_text = (
-                        f"[被引用图片的既有描述（来自 {record.get('source') or '原发送者'}）]: "
-                        f"{'；'.join(record_captions)}"
-                    )
-                    mode = self._inject_caption_text(event, req, cached_text)
+                    cached_text = f"{'；'.join(record_captions)}"
+                    mode = "quoted_message_native_cache"
                     logger.info(
                         f"【图片转述｜成功】kind=quoted_cached, provider=群聊图片描述缓存, "
                         f"mode={mode}, chars={len('；'.join(record_captions))}, "
@@ -1670,7 +1877,7 @@ class SysSettingPortPlugin(Star):
                     record,
                 )
         elif quote_captions and not force_quote_reinspect:
-            cached_text = f"[被引用图片的既有描述（来自 {source_text}）]: {'；'.join(quote_captions)}"
+            cached_text = f"{'；'.join(quote_captions)}"
             mode = self._inject_caption_text(event, req, cached_text)
             logger.info(
                 f"【图片转述｜成功】kind=quoted_cached, provider=群聊图片描述缓存, "
