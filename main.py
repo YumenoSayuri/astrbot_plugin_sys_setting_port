@@ -14,10 +14,15 @@ from astrbot.core.message.components import Image, Reply, At, Plain
 from astrbot.core.agent.message import ImageURLPart, Message, TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 from astrbot.api.event.filter import (
+    PermissionType,
+    command,
+    llm_tool,
+    on_astrbot_loaded,
     on_llm_request,
     on_llm_response,
     on_using_llm_tool,
     on_llm_tool_respond,
+    permission_type,
 )
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
@@ -25,7 +30,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.2.10", "系统设置移植 - 会话请求超时、群聊视觉上下文、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.3.1", "系统设置移植 - 会话请求超时、群聊上下文、群角色感知、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -38,10 +43,13 @@ class SysSettingPortPlugin(Star):
         self.caption_db_path = os.path.join(data_dir, "group_image_captions.db")
         self.caption_db_ready = False
         self.caption_db_lock = asyncio.Lock()
+        self.group_role_sync_lock = asyncio.Lock()
         self.last_chat_records = self._load_data()
         self.request_watchdogs = {}
         self.request_watchdog_sequence = 0
         self.proactive_monitor_task = asyncio.create_task(self._proactive_monitor_loop())
+        self.group_role_sync_task = None
+        self._ensure_group_role_sync_task()
 
     def _load_data(self):
         import os
@@ -65,6 +73,8 @@ class SysSettingPortPlugin(Star):
     async def terminate(self):
         if self.proactive_monitor_task:
             self.proactive_monitor_task.cancel()
+        if self.group_role_sync_task:
+            self.group_role_sync_task.cancel()
         for entry in list(self.request_watchdogs.values()):
             watchdog_task = entry.get("watchdog_task")
             if watchdog_task and not watchdog_task.done():
@@ -369,8 +379,335 @@ class SysSettingPortPlugin(Star):
                     "CREATE INDEX IF NOT EXISTS idx_group_image_fingerprint_sha_time "
                     "ON group_image_fingerprints(sha256, last_seen DESC)"
                 )
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS group_role_snapshots (
+                        platform_id TEXT NOT NULL,
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL DEFAULT '',
+                        role TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (platform_id, group_id, user_id)
+                    )
+                    """
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_group_role_snapshot_group "
+                    "ON group_role_snapshots(platform_id, group_id, role)"
+                )
                 await db.commit()
             self.caption_db_ready = True
+
+    @staticmethod
+    def _unwrap_onebot_list(payload) -> list[dict]:
+        if isinstance(payload, dict):
+            for key in ("data", "members", "items"):
+                if isinstance(payload.get(key), list):
+                    payload = payload[key]
+                    break
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    @staticmethod
+    def _member_display_name(member: dict) -> str:
+        return str(member.get("card") or member.get("nickname") or member.get("name") or member.get("user_id") or "")
+
+    async def _load_group_role_snapshot(self, platform_id: str, group_id: str) -> list[dict]:
+        await self._ensure_caption_db()
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                cursor = await db.execute(
+                    "SELECT user_id, display_name, role, updated_at "
+                    "FROM group_role_snapshots WHERE platform_id = ? AND group_id = ? "
+                    "ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, user_id",
+                    (platform_id, group_id),
+                )
+                rows = await cursor.fetchall()
+        return [
+            {
+                "user_id": str(row[0]),
+                "display_name": str(row[1]),
+                "role": str(row[2]),
+                "updated_at": float(row[3]),
+            }
+            for row in rows
+        ]
+
+    async def _replace_group_role_snapshot(
+        self,
+        platform_id: str,
+        group_id: str,
+        members: list[dict],
+    ) -> tuple[bool, str]:
+        privileged = []
+        for member in members:
+            role = str(member.get("role") or "").lower()
+            user_id = str(member.get("user_id") or member.get("uin") or "").strip()
+            if role in {"owner", "admin"} and user_id:
+                privileged.append(
+                    {
+                        "user_id": user_id,
+                        "display_name": self._member_display_name(member),
+                        "role": role,
+                    }
+                )
+        owners = [item for item in privileged if item["role"] == "owner"]
+        if len(owners) != 1:
+            return False, f"返回数据中群主数量为 {len(owners)}，保留原快照"
+
+        old_rows = await self._load_group_role_snapshot(platform_id, group_id)
+        old_state = {
+            (item["user_id"], item["display_name"], item["role"])
+            for item in old_rows
+        }
+        new_state = {
+            (item["user_id"], item["display_name"], item["role"])
+            for item in privileged
+        }
+        if old_state == new_state:
+            return True, "角色信息没有变化"
+
+        updated_at = time.time()
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                await db.execute("BEGIN")
+                await db.execute(
+                    "DELETE FROM group_role_snapshots WHERE platform_id = ? AND group_id = ?",
+                    (platform_id, group_id),
+                )
+                await db.executemany(
+                    "INSERT INTO group_role_snapshots "
+                    "(platform_id, group_id, user_id, display_name, role, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            platform_id,
+                            group_id,
+                            item["user_id"],
+                            item["display_name"],
+                            item["role"],
+                            updated_at,
+                        )
+                        for item in privileged
+                    ],
+                )
+                await db.commit()
+        return True, f"已保存 1 位群主和 {len(privileged) - 1} 位管理员"
+
+    async def _refresh_group_roles(self, bot, platform_id: str, group_id: str) -> tuple[bool, str]:
+        try:
+            payload = await asyncio.wait_for(
+                bot.call_action("get_group_member_list", group_id=int(group_id)),
+                timeout=30.0,
+            )
+        except Exception as e:
+            return False, f"NapCat 查询失败：{type(e).__name__}: {e}"
+        members = self._unwrap_onebot_list(payload)
+        if not members:
+            return False, "NapCat 未返回群成员，保留原快照"
+        return await self._replace_group_role_snapshot(platform_id, group_id, members)
+
+    def _whitelist_group_targets(self) -> list[tuple[str, str]]:
+        try:
+            config = self.context.get_config()
+            entries = config.get("platform_settings", {}).get("id_whitelist", []) or []
+        except Exception as e:
+            logger.warning(f"读取 AstrBot 系统会话白名单失败: {e}")
+            return []
+        targets = []
+        for raw in entries:
+            value = str(raw).strip()
+            if value.isdigit():
+                targets.append(("", value))
+                continue
+            parts = value.split(":")
+            if len(parts) >= 3 and parts[-2] == "GroupMessage" and parts[-1].isdigit():
+                targets.append((parts[0], parts[-1]))
+        return list(dict.fromkeys(targets))
+
+    def _aiocqhttp_platforms(self):
+        platforms = []
+        for platform in getattr(self.context.platform_manager, "platform_insts", []):
+            try:
+                if platform.meta().name == "aiocqhttp":
+                    platforms.append(platform)
+            except Exception:
+                continue
+        return platforms
+
+    async def _sync_whitelist_group_roles(self) -> dict[str, int]:
+        async with self.group_role_sync_lock:
+            return await self._sync_whitelist_group_roles_unlocked()
+
+    async def _sync_whitelist_group_roles_unlocked(self) -> dict[str, int]:
+        targets = self._whitelist_group_targets()
+        stats = {
+            "whitelist": len(targets),
+            "platforms": 0,
+            "eligible": 0,
+            "success": 0,
+            "failed": 0,
+        }
+        if not targets:
+            logger.info("【群角色同步】AstrBot 系统白名单中没有群会话，跳过")
+            return stats
+        platforms = self._aiocqhttp_platforms()
+        stats["platforms"] = len(platforms)
+        if not platforms:
+            logger.warning("【群角色同步】当前没有可用的 aiocqhttp 平台")
+            return stats
+        for platform in platforms:
+            platform_id = str(platform.meta().id)
+            try:
+                joined_payload = await asyncio.wait_for(
+                    platform.bot.call_action("get_group_list"), timeout=30.0
+                )
+                joined_groups = {
+                    str(item.get("group_id"))
+                    for item in self._unwrap_onebot_list(joined_payload)
+                    if item.get("group_id") is not None
+                }
+            except Exception as e:
+                logger.warning(f"【群角色同步】读取平台群列表失败: platform={platform_id}, error={e}")
+                stats["failed"] += 1
+                continue
+            group_ids = list(
+                dict.fromkeys(
+                    group_id
+                    for platform_hint, group_id in targets
+                    if (not platform_hint or platform_hint == platform_id)
+                    and group_id in joined_groups
+                )
+            )
+            stats["eligible"] += len(group_ids)
+            for index, group_id in enumerate(group_ids):
+                ok, detail = await self._refresh_group_roles(platform.bot, platform_id, group_id)
+                if ok:
+                    stats["success"] += 1
+                    logger.info(f"【群角色同步】group={group_id}, {detail}")
+                else:
+                    stats["failed"] += 1
+                    logger.warning(f"【群角色同步】group={group_id}, {detail}")
+                if index < len(group_ids) - 1:
+                    await asyncio.sleep(0.5)
+        logger.info(
+            "【群角色同步】本轮完成: "
+            f"whitelist={stats['whitelist']}, platforms={stats['platforms']}, "
+            f"eligible={stats['eligible']}, success={stats['success']}, "
+            f"failed={stats['failed']}"
+        )
+        return stats
+
+    async def _group_role_sync_loop(self) -> None:
+        try:
+            while True:
+                stats = await self._sync_whitelist_group_roles()
+                if stats["whitelist"] == 0 or (
+                    stats["eligible"] > 0 and stats["failed"] == 0
+                ):
+                    break
+                logger.warning("【群角色同步】首次同步尚未完成，5 分钟后自动补偿")
+                await asyncio.sleep(300)
+            interval_days = max(1, int(self.config.get("group_role_sync_interval_days", 7)))
+            while True:
+                await asyncio.sleep(interval_days * 86400)
+                await self._sync_whitelist_group_roles()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"群角色周期同步异常退出: {e}", exc_info=True)
+
+    def _ensure_group_role_sync_task(self) -> None:
+        if not self.config.get("enable_group_role_context", True):
+            return
+        if self.group_role_sync_task and not self.group_role_sync_task.done():
+            return
+        self.group_role_sync_task = asyncio.create_task(self._group_role_sync_loop())
+
+    @on_astrbot_loaded()
+    async def start_group_role_sync(self, *args, **kwargs):
+        self._ensure_group_role_sync_task()
+
+    @permission_type(PermissionType.ADMIN)
+    @command("同步群角色")
+    async def sync_all_group_roles_command(self, event: AstrMessageEvent):
+        stats = await self._sync_whitelist_group_roles()
+        yield event.plain_result(
+            "群角色同步完成："
+            f"系统白名单群 {stats['whitelist']} 个，"
+            f"当前可同步 {stats['eligible']} 个，"
+            f"成功 {stats['success']} 个，失败 {stats['failed']} 个。"
+        )
+
+    @llm_tool("sys_refresh_group_roles")
+    async def refresh_current_group_roles(self, event: AstrMessageEvent) -> str:
+        """重新查询并持久化当前 QQ 群的群主与管理员。当聊天中有人提到群主、管理员或权限发生变化，或者当前角色快照可能过时时使用。只刷新当前会话所在群；查询失败或返回无效数据时保留旧快照。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id or event.get_platform_name() != "aiocqhttp":
+            return "刷新失败：此工具只能在当前 QQ 群会话中使用。"
+        platform_id = str(event.get_platform_id() or "").strip()
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return "刷新失败：无法取得当前 QQ 平台连接。"
+        ok, detail = await self._refresh_group_roles(bot, platform_id, group_id)
+        if not ok:
+            return f"刷新失败：{detail}"
+        rows = await self._load_group_role_snapshot(platform_id, group_id)
+        owner = next((item for item in rows if item["role"] == "owner"), None)
+        admins = [item for item in rows if item["role"] == "admin"]
+        owner_text = f"{owner['display_name']}({owner['user_id']})" if owner else "未知"
+        admin_text = "、".join(f"{item['display_name']}({item['user_id']})" for item in admins) or "无"
+        return f"当前群角色已核验：{detail}。群主：{owner_text}；管理员：{admin_text}。"
+
+    async def _build_group_role_context(self, event: AstrMessageEvent) -> str:
+        if not self.config.get("enable_group_role_context", True):
+            return ""
+        group_id = str(event.get_group_id() or "").strip()
+        platform_id = str(event.get_platform_id() or "").strip()
+        if not group_id or event.get_platform_name() != "aiocqhttp":
+            return ""
+        rows = await self._load_group_role_snapshot(platform_id, group_id)
+        if not rows:
+            return (
+                "<group_role_context>\n"
+                f"当前群: {group_id}\n"
+                "群角色快照尚未建立。不要猜测任何人的群权限；必要时调用 sys_refresh_group_roles 核验当前群。\n"
+                "</group_role_context>"
+            )
+        owner = next((item for item in rows if item["role"] == "owner"), None)
+        admins = [item for item in rows if item["role"] == "admin"]
+        role_by_id = {item["user_id"]: item["role"] for item in rows}
+        sender_id = str(event.get_sender_id() or "")
+        sender_name = str(event.get_sender_name() or sender_id)
+        self_id = str(getattr(event.message_obj, "self_id", "") or "")
+
+        def role_label(user_id: str) -> str:
+            return {"owner": "群主", "admin": "管理员"}.get(
+                role_by_id.get(user_id), "普通群成员"
+            )
+
+        owner_text = f"{owner['display_name']}({owner['user_id']})" if owner else "未知"
+        admin_text = "、".join(f"{item['display_name']}({item['user_id']})" for item in admins) or "无"
+        lines = [
+            "<group_role_context>",
+            "以下是当前 QQ 群的持久化角色快照，仅用于本轮判断，不是用户原话。",
+            f"当前群: {group_id}",
+            f"Bot 自身身份: {role_label(self_id)} (QQ: {self_id or '未知'})",
+            f"群主: {owner_text}",
+            f"管理员: {admin_text}",
+        ]
+        if not event.get_extra("crossflow_synthetic_event", False):
+            lines.append(f"当前发言人: {sender_name}({sender_id})，身份: {role_label(sender_id)}")
+        else:
+            lines.append("当前事件是跨会话委托，不要把来源请求者误认成目标群的当前发言人。")
+        lines.extend(
+            [
+                "不在上述群主或管理员名单中的群成员，按普通群成员理解。",
+                "若对话明确提到群主、管理员或权限刚发生变化，可调用 sys_refresh_group_roles 重新核验；不要仅凭聊天说法自行改写身份。",
+                "</group_role_context>",
+            ]
+        )
+        return "\n".join(lines)
 
     def _caption_cache_ttl_seconds(self) -> int:
         hours = max(0, int(self.config.get("group_visual_cache_ttl_hours", 24)))
@@ -1558,6 +1895,18 @@ class SysSettingPortPlugin(Star):
             return
 
         group_id = str(event.get_group_id() or "")
+        try:
+            role_context = await self._build_group_role_context(event)
+        except Exception as e:
+            role_context = ""
+            logger.error(f"读取群角色快照失败: group={group_id}, error={e}")
+        if role_context:
+            if req.contexts is None:
+                req.contexts = []
+            temporary_message = Message(role="user", content=role_context)
+            object.__setattr__(temporary_message, "_no_save", True)
+            req.contexts.append(temporary_message)
+
         if self._group_context_enabled(event):
             try:
                 history_text = await self._load_latest_group_history(event)
