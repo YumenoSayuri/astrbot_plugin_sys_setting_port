@@ -146,6 +146,19 @@
         "_special": "select_provider",
         "default": ""
     },
+    "group_visual_fallback_provider_id": {
+        "description": "群聊图片理解兜底模型",
+        "hint": "群聊图片理解主模型完成全部重试仍失败后，切换到此备用视觉模型，并按群聊视觉最大重试次数重新尝试；留空则不使用兜底。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "group_visual_max_retries": {
+        "description": "群聊视觉模型最大尝试次数",
+        "hint": "群聊静默图片理解的单个模型返回空、质量判定失败或报错时，最多调用多少次，默认 3 次；主模型全部失败后，兜底模型会重新获得同样次数。",
+        "type": "int",
+        "default": 3
+    },
     "group_visual_llm_timeout_seconds": {
         "description": "群聊图片感知 LLM 单次超时 (秒)",
         "hint": "群聊静默图片感知每次调用视觉模型允许等待的最长时间，默认 120 秒。每次重试独立计算此时限。",
@@ -203,7 +216,7 @@
     },
     "fallback_provider_id": {
         "description": "兜底次选转述模型",
-        "hint": "当主转述模型重试全部失败时，使用的备用模型提供商 ID。留空则不使用兜底。",
+        "hint": "当普通多模态转述主模型重试全部失败时，使用的备用模型提供商 ID。留空则不使用兜底。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
@@ -221,8 +234,8 @@
         "default": "请详细描述这张图片的内容，以便纯文本模型能够理解。"
     },
     "max_retries": {
-        "description": "最大重试次数",
-        "hint": "当转述模型返回空或报错时，自动重试的次数。",
+        "description": "多模态转述模型最大尝试次数",
+        "hint": "普通多模态转述的单个模型返回空、质量判定失败或报错时，最多调用多少次，默认 3 次；主转述模型全部失败后，兜底转述模型会重新获得同样次数。",
         "type": "int",
         "default": 3
     },
@@ -254,6 +267,12 @@
     "enable_caption_structured": {
         "description": "启用结构化转述输出",
         "hint": "开启后，将强制要求转述模型将描述内容包裹在 <caption_result> 标签中，便于精准提取并过滤废话。",
+        "type": "bool",
+        "default": true
+    },
+    "enable_gif_frame_staticization": {
+        "description": "GIF 转首帧/中帧/尾帧静态图",
+        "hint": "默认开启。SYS 向群聊视觉主备模型、图片转述主备模型或多模态主聊天模型发送 GIF 前，在内存中转为首帧、中帧、尾帧 JPEG；不产生临时文件，重复帧自动去重，转换失败回退原 GIF。原始 GIF 的 SHA 和消息缓存关联保持不变。",
         "type": "bool",
         "default": true
     }

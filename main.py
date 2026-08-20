@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import copy
 import datetime
 import hashlib
+import io
 import os
 import time
 from collections import Counter
@@ -11,7 +13,7 @@ import aiosqlite
 
 from astrbot.api.all import *
 from astrbot.core.message.components import Image, Reply, At, Plain
-from astrbot.core.agent.message import ImageURLPart, Message, TextPart
+from astrbot.core.agent.message import Message, TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 from astrbot.api.event.filter import (
     PermissionType,
@@ -30,7 +32,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.3.1", "系统设置移植 - 会话请求超时、群聊上下文、群角色感知、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.3.4", "系统设置移植 - 会话请求超时、群聊上下文、群角色感知、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -330,6 +332,7 @@ class SysSettingPortPlugin(Star):
                         message_id TEXT NOT NULL,
                         image_key TEXT NOT NULL,
                         caption TEXT NOT NULL,
+                        is_gif INTEGER NOT NULL DEFAULT 0,
                         sender_name TEXT NOT NULL DEFAULT '',
                         sender_id TEXT NOT NULL DEFAULT '',
                         created_at REAL NOT NULL,
@@ -337,6 +340,13 @@ class SysSettingPortPlugin(Star):
                     )
                     """
                 )
+                cursor = await db.execute("PRAGMA table_info(group_image_captions)")
+                caption_columns = {str(row[1]) for row in await cursor.fetchall()}
+                if "is_gif" not in caption_columns:
+                    await db.execute(
+                        "ALTER TABLE group_image_captions "
+                        "ADD COLUMN is_gif INTEGER NOT NULL DEFAULT 0"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_group_image_session_time "
                     "ON group_image_captions(session_id, created_at DESC)"
@@ -350,6 +360,7 @@ class SysSettingPortPlugin(Star):
                         sha256 TEXT NOT NULL,
                         caption TEXT NOT NULL,
                         image_count INTEGER NOT NULL,
+                        is_gif INTEGER NOT NULL DEFAULT 0,
                         created_at REAL NOT NULL,
                         hit_count INTEGER NOT NULL DEFAULT 1,
                         first_seen REAL NOT NULL DEFAULT 0,
@@ -361,6 +372,7 @@ class SysSettingPortPlugin(Star):
                 cursor = await db.execute("PRAGMA table_info(group_image_fingerprints)")
                 fingerprint_columns = {str(row[1]) for row in await cursor.fetchall()}
                 for column, definition in (
+                    ("is_gif", "INTEGER NOT NULL DEFAULT 0"),
                     ("hit_count", "INTEGER NOT NULL DEFAULT 1"),
                     ("first_seen", "REAL NOT NULL DEFAULT 0"),
                     ("last_seen", "REAL NOT NULL DEFAULT 0"),
@@ -725,7 +737,7 @@ class SysSettingPortPlugin(Star):
         ttl_seconds = self._caption_cache_ttl_seconds()
         placeholders = ",".join("?" for _ in unique_ids)
         query = (
-            "SELECT message_id, caption FROM group_image_captions "
+            "SELECT message_id, caption, is_gif FROM group_image_captions "
             f"WHERE session_id = ? AND message_id IN ({placeholders})"
         )
         params = [session_id, *unique_ids]
@@ -737,9 +749,12 @@ class SysSettingPortPlugin(Star):
         async with aiosqlite.connect(self.caption_db_path) as db:
             cursor = await db.execute(query, params)
             rows = await cursor.fetchall()
-        for message_id, caption in rows:
+        for message_id, caption, is_gif in rows:
             if caption:
-                result.setdefault(str(message_id), []).append(str(caption))
+                caption_text = str(caption)
+                if bool(is_gif):
+                    caption_text = self._with_gif_human_hint(caption_text)
+                result.setdefault(str(message_id), []).append(caption_text)
         return result
 
     async def _get_message_captions(self, session_id: str, message_id: str) -> list[str]:
@@ -753,8 +768,13 @@ class SysSettingPortPlugin(Star):
         captions: list[tuple[str, str]],
         sender_name: str,
         sender_id: str,
+        is_gif: bool = False,
     ):
-        valid = [(str(key), str(caption).strip()) for key, caption in captions if str(caption).strip()]
+        valid = [
+            (str(key), self._strip_gif_human_hint(str(caption).strip()))
+            for key, caption in captions
+            if str(caption).strip()
+        ]
         if not session_id or not message_id or not valid:
             return
         await self._ensure_caption_db()
@@ -766,16 +786,21 @@ class SysSettingPortPlugin(Star):
                 await db.executemany(
                     """
                     INSERT INTO group_image_captions
-                    (session_id, message_id, image_key, caption, sender_name, sender_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (session_id, message_id, image_key, caption, is_gif,
+                     sender_name, sender_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id, message_id, image_key) DO UPDATE SET
                         caption=excluded.caption,
+                        is_gif=excluded.is_gif,
                         sender_name=excluded.sender_name,
                         sender_id=excluded.sender_id,
                         created_at=excluded.created_at
                     """,
                     [
-                        (session_id, message_id, key, caption, sender_name, sender_id, now)
+                        (
+                            session_id, message_id, key, caption, int(is_gif),
+                            sender_name, sender_id, now,
+                        )
                         for key, caption in valid
                     ],
                 )
@@ -809,7 +834,7 @@ class SysSettingPortPlugin(Star):
         placeholders = ",".join("?" for _ in unique_hashes)
         query = (
             "SELECT session_id, message_id, position, sha256, caption, "
-            "image_count, first_seen, last_seen FROM group_image_fingerprints "
+            "image_count, is_gif, first_seen, last_seen FROM group_image_fingerprints "
             f"WHERE sha256 IN ({placeholders}) ORDER BY last_seen DESC"
         )
         async with aiosqlite.connect(self.caption_db_path) as db:
@@ -817,7 +842,7 @@ class SysSettingPortPlugin(Star):
             rows = await cursor.fetchall()
 
         candidates = {}
-        for session_id, message_id, position, sha256, caption, image_count, first_seen, last_seen in rows:
+        for session_id, message_id, position, sha256, caption, image_count, is_gif, first_seen, last_seen in rows:
             key = (str(session_id), str(message_id))
             candidate = candidates.setdefault(
                 key,
@@ -826,6 +851,7 @@ class SysSettingPortPlugin(Star):
                     "hashes": [],
                     "caption": str(caption),
                     "image_count": int(image_count),
+                    "is_gif": bool(is_gif),
                     "first_seen": float(first_seen),
                     "last_seen": float(last_seen),
                 },
@@ -863,14 +889,19 @@ class SysSettingPortPlugin(Star):
                     (now, *matched["key"]),
                 )
                 await db.commit()
-        return matched["caption"]
+        return (
+            self._with_gif_human_hint(matched["caption"])
+            if matched["is_gif"]
+            else matched["caption"]
+        )
 
     async def _replace_image_fingerprint_caption(
         self,
         hashes: list[str],
         caption: str,
+        is_gif: bool = False,
     ) -> bool:
-        caption = str(caption).strip()
+        caption = self._strip_gif_human_hint(str(caption).strip())
         if not hashes or not caption:
             return False
         await self._ensure_caption_db()
@@ -924,10 +955,10 @@ class SysSettingPortPlugin(Star):
                     return False
 
                 await db.execute(
-                    "UPDATE group_image_fingerprints SET caption = ?, "
+                    "UPDATE group_image_fingerprints SET caption = ?, is_gif = ?, "
                     "hit_count = hit_count + 1, last_seen = ? "
                     "WHERE session_id = ? AND message_id = ?",
-                    (caption, time.time(), *matched["key"]),
+                    (caption, int(is_gif), time.time(), *matched["key"]),
                 )
                 await db.commit()
         return True
@@ -971,8 +1002,9 @@ class SysSettingPortPlugin(Star):
         hashes: list[str],
         caption: str,
         image_count: int,
+        is_gif: bool = False,
     ):
-        caption = str(caption).strip()
+        caption = self._strip_gif_human_hint(str(caption).strip())
         if not session_id or not message_id or not hashes or not caption:
             return
         await self._ensure_caption_db()
@@ -989,8 +1021,8 @@ class SysSettingPortPlugin(Star):
                     """
                     INSERT INTO group_image_fingerprints
                     (session_id, message_id, position, sha256, caption, image_count,
-                     created_at, hit_count, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                     is_gif, created_at, hit_count, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     [
                         (
@@ -1000,6 +1032,7 @@ class SysSettingPortPlugin(Star):
                             sha256,
                             caption,
                             image_count,
+                            int(is_gif),
                             now,
                             now,
                             now,
@@ -1046,6 +1079,10 @@ class SysSettingPortPlugin(Star):
         paths: list[str] | None = None,
     ) -> str:
         provider_id = self.config.get("group_visual_provider_id", "")
+        fallback_provider_id = self.config.get(
+            "group_visual_fallback_provider_id",
+            "",
+        )
         if not provider_id or not images:
             return ""
         prompt = self.config.get(
@@ -1054,7 +1091,10 @@ class SysSettingPortPlugin(Star):
         )
         if len(images) > 1:
             prompt += f"\n本条消息包含 {len(images)} 张图片，请按图片顺序给出一份联合描述并说明它们之间的关系。"
-        max_retries = max(1, int(self.config.get("max_retries", 3)))
+        max_retries = max(
+            1,
+            int(self.config.get("group_visual_max_retries", 3)),
+        )
         timeout_seconds = max(
             1,
             int(self.config.get("group_visual_llm_timeout_seconds", 120)),
@@ -1067,13 +1107,40 @@ class SysSettingPortPlugin(Star):
                     f"群聊图片理解已取消: images={len(images)}，没有可发送的有效图片"
                 )
                 return ""
-            return await self._try_caption(
-                provider_id,
-                prompt,
+            visual_paths, gif_converted = self._prepare_visual_image_paths(
                 paths,
+                bool(self.config.get("enable_gif_frame_staticization", True)),
+            )
+            visual_prompt = prompt
+            if gif_converted:
+                visual_prompt = f"{prompt}\n\n{self._gif_human_hint()}"
+            caption = await self._try_caption(
+                provider_id,
+                visual_prompt,
+                visual_paths,
                 max_retries,
                 timeout_seconds,
             )
+            if caption:
+                return caption
+            if fallback_provider_id and fallback_provider_id != provider_id:
+                fallback_provider = self.context.get_provider_by_id(
+                    fallback_provider_id
+                )
+                logger.warning(
+                    f"群聊图片理解主模型失败，准备调用兜底模型: "
+                    f"provider={self._provider_log_name(fallback_provider_id, fallback_provider)}, "
+                    f"images={len(paths)}, retries={max_retries}, timeout={timeout_seconds}s"
+                )
+                fallback_caption = await self._try_caption(
+                    fallback_provider_id,
+                    visual_prompt,
+                    visual_paths,
+                    max_retries,
+                    timeout_seconds,
+                )
+                return fallback_caption
+            return ""
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1245,6 +1312,10 @@ class SysSettingPortPlugin(Star):
                 )
                 return
             hashes = await self._hash_image_paths(paths)
+            is_gif = bool(
+                self.config.get("enable_gif_frame_staticization", True)
+                and any(self._is_gif_path(path) for path in paths)
+            )
             caption = await self._find_reusable_image_caption(hashes)
             reused = bool(caption)
             if reused:
@@ -1261,6 +1332,7 @@ class SysSettingPortPlugin(Star):
                     [("message_image_bundle", caption)],
                     event.get_sender_name() or str(event.get_sender_id()),
                     str(event.get_sender_id()),
+                    is_gif=is_gif,
                 )
                 if not reused:
                     await self._save_image_fingerprints(
@@ -1269,6 +1341,7 @@ class SysSettingPortPlugin(Star):
                         hashes,
                         caption,
                         len(images),
+                        is_gif=is_gif,
                     )
                 logger.info(
                     f"群聊静默图片描述已持久化: group={cache_session_id}, "
@@ -1584,34 +1657,29 @@ class SysSettingPortPlugin(Star):
         return True
 
     @classmethod
-    def _embed_images_in_quoted_message(
+    def _mark_quoted_message_images(
         cls,
         req: ProviderRequest,
         quote_record: dict,
-        image_paths: list[str],
+        image_count: int,
+        is_gif: bool = False,
     ) -> bool:
         index = cls._find_native_quote_part_index(req)
-        if index < 0 or not image_paths:
+        if index < 0 or image_count <= 0:
             return False
         sender_name = str(quote_record.get("sender_name") or "未知用户")
-        message_id = str(quote_record.get("message_id") or "unknown")
         original_text = str(quote_record.get("message_str") or "").strip()
-        opening_body = f"({sender_name}):"
-        if original_text:
-            opening_body += f" {original_text}"
-        opening_body += "\n[该历史消息中的图片如下]"
-        replacement_parts = [TextPart(text=f"<Quoted Message>\n{opening_body}")]
-        replacement_parts.extend(
-            ImageURLPart(
-                image_url=ImageURLPart.ImageURL(
-                    url=path,
-                    id=f"quoted:{message_id}:{position}",
-                )
-            )
-            for position, path in enumerate(image_paths)
+        media_kind = "GIF 动图" if is_gif else "图片"
+        image_text = (
+            f"[该历史消息包含 {image_count} 张{media_kind}；画面已通过本轮标准多模态图片输入附带，"
+            f"发送者是 {sender_name}，不是当前引用者"
+            + (f"；{cls._gif_human_hint()}" if is_gif else "")
+            + "]"
         )
-        replacement_parts.append(TextPart(text="\n</Quoted Message>"))
-        req.extra_user_content_parts[index:index + 1] = replacement_parts
+        quoted_body = " ".join(part for part in (original_text, image_text) if part)
+        req.extra_user_content_parts[index] = TextPart(
+            text=f"<Quoted Message>\n({sender_name}): {quoted_body}\n</Quoted Message>"
+        )
         return True
 
     @staticmethod
@@ -1624,8 +1692,91 @@ class SysSettingPortPlugin(Star):
         return len(req.contexts) - 1
 
     @staticmethod
+    def _gif_human_hint() -> str:
+        return (
+            "因为只识别了其中三帧，若群友说你看的不完整、看错，或问你的问题转述没提到，"
+            "你可以说手机网络不好、动图没加载全等理由"
+        )
+
+    @classmethod
+    def _strip_gif_human_hint(cls, caption: str) -> str:
+        clean_caption = str(caption).replace(cls._gif_human_hint(), "").strip()
+        if clean_caption.startswith("[GIF 动图：") and clean_caption.endswith("]"):
+            clean_caption = clean_caption[8:-1].strip()
+        return clean_caption.rstrip("；。 ")
+
+    @classmethod
+    def _with_gif_human_hint(cls, caption: str) -> str:
+        clean_caption = cls._strip_gif_human_hint(caption)
+        if clean_caption.startswith("[GIF 动图：") and clean_caption.endswith("]"):
+            clean_caption = clean_caption[8:-1].strip()
+        return f"[GIF 动图：{clean_caption}；{cls._gif_human_hint()}]"
+
+    @classmethod
+    def _is_gif_path(cls, path: str) -> bool:
+        try:
+            with open(path, "rb") as file:
+                return file.read(4).startswith(b"GIF8")
+        except Exception:
+            return False
+
+    @classmethod
+    def _gif_frame_payloads(cls, path: str) -> list[str]:
+        try:
+            from PIL import Image as PILImage
+
+            with PILImage.open(path) as image:
+                frame_count = max(1, int(getattr(image, "n_frames", 1)))
+                indexes = list(dict.fromkeys((0, frame_count // 2, frame_count - 1)))
+                payloads = []
+                seen = set()
+                for index in indexes:
+                    image.seek(index)
+                    frame = image.convert("RGB")
+                    output = io.BytesIO()
+                    frame.save(output, format="JPEG", quality=85, optimize=True)
+                    raw = output.getvalue()
+                    fingerprint = hashlib.sha256(raw).digest()
+                    if fingerprint in seen:
+                        continue
+                    seen.add(fingerprint)
+                    payloads.append("base64://" + base64.b64encode(raw).decode("ascii"))
+                return payloads
+        except Exception as error:
+            logger.warning(
+                f"GIF 静态化失败，将回退原图: path={path}, "
+                f"error={type(error).__name__}: {error}"
+            )
+            return []
+
+    @classmethod
+    def _prepare_visual_image_paths(
+        cls,
+        paths: list[str],
+        enabled: bool,
+    ) -> tuple[list[str], bool]:
+        if not enabled:
+            return list(paths), False
+        prepared = []
+        converted = False
+        for path in paths:
+            if cls._is_gif_path(path):
+                frames = cls._gif_frame_payloads(path)
+                if frames:
+                    prepared.extend(frames)
+                    converted = True
+                    continue
+            prepared.append(path)
+        return prepared, converted
+
+    @staticmethod
     def _inspect_image_path(path: str) -> tuple[bool, str]:
         try:
+            if path.startswith("base64://"):
+                raw = base64.b64decode(path[9:], validate=True)
+                if raw.startswith(b"\xFF\xD8\xFF"):
+                    return True, f"jpeg-base64(size={len(raw)})"
+                return False, f"base64-unknown(size={len(raw)})"
             if not os.path.exists(path):
                 return False, "不存在"
             size = os.path.getsize(path)
@@ -1973,6 +2124,9 @@ class SysSettingPortPlugin(Star):
             1,
             int(self.config.get("caption_llm_timeout_seconds", 90)),
         )
+        gif_staticization_enabled = bool(
+            self.config.get("enable_gif_frame_staticization", True)
+        )
         curr_prov = self.context.get_using_provider(event.unified_msg_origin)
         is_target_text_model, matched_keyword, model_candidates = self._match_target_model(req, curr_prov, target_models)
 
@@ -2020,7 +2174,20 @@ class SysSettingPortPlugin(Star):
         all_paths = [*current_paths, *quote_paths]
         if not all_paths:
             return
-        req.image_urls = all_paths
+        visual_all_paths, request_has_gif = self._prepare_visual_image_paths(
+            all_paths,
+            gif_staticization_enabled,
+        )
+        req.image_urls = visual_all_paths
+        current_has_gif = gif_staticization_enabled and any(
+            self._is_gif_path(path) for path in current_paths
+        )
+        if current_has_gif and not is_target_text_model:
+            req.extra_user_content_parts.append(
+                TextPart(
+                    text=f"[当前用户消息包含 GIF 动图；{self._gif_human_hint()}]"
+                )
+            )
         source_text = "；".join(dict.fromkeys(quote_sources)) or "原发送者"
         inspect_keywords = self.config.get("quote_image_inspect_keywords", ["仔细看", "看原图", "看细节", "重新看", "重看", "再看"])
         wants_original = bool(quote_paths) and not is_target_text_model and any(
@@ -2034,33 +2201,43 @@ class SysSettingPortPlugin(Star):
                     if caption:
                         quote_captions.append(caption)
             if quote_paths and quote_captions and not wants_original:
-                req.image_urls = current_paths
+                req.image_urls, _ = self._prepare_visual_image_paths(
+                    current_paths,
+                    gif_staticization_enabled,
+                )
                 logger.info(
                     f"【图片转述｜成功】provider=群聊图片描述缓存, "
                     f"mode=quoted_message_native_cache, "
                     f"chars={len('；'.join(quote_captions))}, images={len(quote_paths)}"
                 )
             elif quote_paths:
-                req.image_urls = current_paths
-                embedded_count = 0
+                req.image_urls = visual_all_paths
+                marked_images = 0
                 for record in quote_records:
-                    record_paths = list(
-                        dict.fromkeys(
-                            resolved_paths[id(image)]
-                            for image in record.get("images", [])
-                            if id(image) in resolved_paths
-                        )
+                    record_paths = [
+                        resolved_paths[id(image)]
+                        for image in record.get("images", [])
+                        if id(image) in resolved_paths
+                    ]
+                    record_image_count = len(record_paths)
+                    record_has_gif = gif_staticization_enabled and any(
+                        self._is_gif_path(path) for path in record_paths
                     )
-                    if self._embed_images_in_quoted_message(req, record, record_paths):
-                        embedded_count += len(record_paths)
-                if embedded_count < len(quote_paths):
-                    fallback_paths = quote_paths[embedded_count:]
-                    req.image_urls = [*current_paths, *fallback_paths]
+                    if self._mark_quoted_message_images(
+                        req,
+                        record,
+                        record_image_count,
+                        is_gif=record_has_gif,
+                    ):
+                        marked_images += record_image_count
+                if marked_images < len(quote_paths):
                     for record in quote_records:
                         self._inject_caption_text(event, req, "原图直通", record)
                 logger.info(
-                    f"【引用图片｜多模态直通】引用原图已嵌入原生引用结构: "
-                    f"embedded={embedded_count}, fallback={len(quote_paths) - embedded_count}"
+                    f"【引用图片｜多模态直通】引用归属已写入原生引用结构，"
+                    f"原图已保留在标准图片通道: quote_images={len(quote_paths)}, "
+                    f"current_images={len(current_paths)}, request_images={len(req.image_urls)}, "
+                    f"ownership_marked={marked_images}, gif_staticized={request_has_gif}"
                 )
             return
 
@@ -2085,6 +2262,9 @@ class SysSettingPortPlugin(Star):
             if not paths:
                 return
             hashes = await self._hash_image_paths(paths)
+            has_gif = gif_staticization_enabled and any(
+                self._is_gif_path(path) for path in paths
+            )
             force_reinspect = kind == "quoted_reinspect"
             caption = (
                 ""
@@ -2099,20 +2279,37 @@ class SysSettingPortPlugin(Star):
                     f"hashed={len(hashes)}"
                 )
             else:
+                visual_paths, gif_converted = self._prepare_visual_image_paths(
+                    paths,
+                    gif_staticization_enabled,
+                )
+                visual_prompt = caption_prompt
+                if gif_converted:
+                    visual_prompt = f"{caption_prompt}\n\n{self._gif_human_hint()}"
                 logger.info(
                     f"【图片转述｜触发】kind={kind}, 目标关键词={matched_keyword}, "
                     f"current_models={model_candidates}, caption_provider="
-                    f"{self._provider_log_name(caption_provider_id, caption_provider)}, images={len(paths)}"
+                    f"{self._provider_log_name(caption_provider_id, caption_provider)}, "
+                    f"images={len(paths)}, provider_images={len(visual_paths)}, "
+                    f"gif_staticized={gif_converted}"
                 )
                 caption = await self._try_caption(
                     caption_provider_id,
-                    caption_prompt,
-                    paths,
+                    visual_prompt,
+                    visual_paths,
                     max_retries,
                     caption_timeout_seconds,
                 )
             used_provider_id, used_provider = caption_provider_id, caption_provider
             if not caption and fallback_provider_id:
+                if reused:
+                    visual_paths, gif_converted = self._prepare_visual_image_paths(
+                        paths,
+                        gif_staticization_enabled,
+                    )
+                    visual_prompt = caption_prompt
+                    if gif_converted:
+                        visual_prompt = f"{caption_prompt}\n\n{self._gif_human_hint()}"
                 fallback_provider = self.context.get_provider_by_id(fallback_provider_id)
                 logger.warning(
                     f"【图片转述｜主模型失败】kind={kind}, 准备调用兜底模型 "
@@ -2120,8 +2317,8 @@ class SysSettingPortPlugin(Star):
                 )
                 caption = await self._try_caption(
                     fallback_provider_id,
-                    caption_prompt,
-                    paths,
+                    visual_prompt,
+                    visual_paths,
                     max_retries,
                     caption_timeout_seconds,
                 )
@@ -2132,7 +2329,11 @@ class SysSettingPortPlugin(Star):
                     f"target={matched_keyword}, images={len(paths)}"
                 )
                 return
-            caption_text = caption
+            caption_text = (
+                self._with_gif_human_hint(caption)
+                if has_gif
+                else caption
+            )
             if quote_record and not event.is_private_chat():
                 replaced = self._replace_quoted_message_text(
                     req,
@@ -2168,6 +2369,7 @@ class SysSettingPortPlugin(Star):
                     [(image_key, caption)],
                     sender_name,
                     sender_id,
+                    is_gif=has_gif,
                 )
                 if hashes and not reused:
                     fingerprint_replaced = False
@@ -2175,6 +2377,7 @@ class SysSettingPortPlugin(Star):
                         fingerprint_replaced = await self._replace_image_fingerprint_caption(
                             hashes,
                             caption,
+                            is_gif=has_gif,
                         )
                     if not fingerprint_replaced:
                         await self._save_image_fingerprints(
@@ -2183,6 +2386,7 @@ class SysSettingPortPlugin(Star):
                             hashes,
                             caption,
                             len(paths),
+                            is_gif=has_gif,
                         )
                 logger.info(
                     f"【图片转述｜消息描述已持久化】group={cache_session_id}, "
