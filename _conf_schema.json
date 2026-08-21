@@ -275,5 +275,11 @@
         "hint": "默认开启。SYS 向群聊视觉主备模型、图片转述主备模型或多模态主聊天模型发送 GIF 前，在内存中转为首帧、中帧、尾帧 JPEG；不产生临时文件，重复帧自动去重，转换失败回退原 GIF。原始 GIF 的 SHA 和消息缓存关联保持不变。",
         "type": "bool",
         "default": true
+    },
+    "send_force_recaption_content": {
+        "description": "重新转述成功后发送描述内容",
+        "hint": "默认开启。开启时，管理员执行 /重新转述图片 成功后直接返回新描述；关闭时只确认旧缓存已替换，可通过 /查看转述 单独查看内容。",
+        "type": "bool",
+        "default": true
     }
 }

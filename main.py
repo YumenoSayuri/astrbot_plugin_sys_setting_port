@@ -32,7 +32,7 @@ class UserSessionFilter(SessionFilter):
     def filter(self, event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}_{event.get_sender_id()}"
 
-@register("astrbot_plugin_sys_setting_port", "Nova", "2.3.4", "系统设置移植 - 会话请求超时、群聊上下文、群角色感知、多模态转述与自定义等待")
+@register("astrbot_plugin_sys_setting_port", "Nova", "2.3.6", "系统设置移植 - 会话请求超时、群聊上下文、群角色感知、多模态转述与自定义等待")
 class SysSettingPortPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -761,6 +761,30 @@ class SysSettingPortPlugin(Star):
         result = await self._get_captions_by_message_ids(session_id, [message_id])
         return result.get(str(message_id), [])
 
+    async def _peek_message_captions(
+        self,
+        session_id: str,
+        message_id: str,
+    ) -> list[str]:
+        if not session_id or not message_id:
+            return []
+        await self._ensure_caption_db()
+        async with aiosqlite.connect(self.caption_db_path) as db:
+            cursor = await db.execute(
+                "SELECT caption, is_gif FROM group_image_captions "
+                "WHERE session_id = ? AND message_id = ? "
+                "ORDER BY created_at ASC, rowid ASC",
+                (session_id, message_id),
+            )
+            rows = await cursor.fetchall()
+        return [
+            self._with_gif_human_hint(str(caption))
+            if bool(is_gif)
+            else str(caption)
+            for caption, is_gif in rows
+            if caption
+        ]
+
     async def _save_message_captions(
         self,
         session_id: str,
@@ -895,6 +919,72 @@ class SysSettingPortPlugin(Star):
             else matched["caption"]
         )
 
+    async def _peek_reusable_image_caption(self, hashes: list[str]) -> str:
+        if not hashes:
+            return ""
+        await self._ensure_caption_db()
+        unique_hashes = list(dict.fromkeys(hashes))
+        placeholders = ",".join("?" for _ in unique_hashes)
+        query = (
+            "SELECT session_id, message_id, position, sha256, caption, "
+            "image_count, is_gif, last_seen FROM group_image_fingerprints "
+            f"WHERE sha256 IN ({placeholders}) ORDER BY last_seen DESC"
+        )
+        async with aiosqlite.connect(self.caption_db_path) as db:
+            cursor = await db.execute(query, unique_hashes)
+            rows = await cursor.fetchall()
+
+        candidates = {}
+        for (
+            session_id,
+            message_id,
+            position,
+            sha256,
+            caption,
+            image_count,
+            is_gif,
+            last_seen,
+        ) in rows:
+            key = (str(session_id), str(message_id))
+            candidate = candidates.setdefault(
+                key,
+                {
+                    "hashes": [],
+                    "caption": str(caption),
+                    "image_count": int(image_count),
+                    "is_gif": bool(is_gif),
+                    "last_seen": float(last_seen),
+                },
+            )
+            candidate["hashes"].append((int(position), str(sha256)))
+
+        current_counter = Counter(hashes)
+        for candidate in sorted(
+            candidates.values(),
+            key=lambda item: item["last_seen"],
+            reverse=True,
+        ):
+            candidate_hashes = [
+                sha256 for _, sha256 in sorted(candidate["hashes"])
+            ]
+            if len(hashes) == 1:
+                matched = (
+                    candidate["image_count"] == 1
+                    and candidate_hashes == hashes
+                )
+            else:
+                overlap = sum(
+                    (current_counter & Counter(candidate_hashes)).values()
+                )
+                matched = candidate["image_count"] >= 2 and overlap >= 2
+            if matched:
+                return (
+                    self._with_gif_human_hint(candidate["caption"])
+                    if candidate["is_gif"]
+                    else candidate["caption"]
+                )
+        return ""
+
     async def _replace_image_fingerprint_caption(
         self,
         hashes: list[str],
@@ -961,6 +1051,150 @@ class SysSettingPortPlugin(Star):
                     (caption, int(is_gif), time.time(), *matched["key"]),
                 )
                 await db.commit()
+        return True
+
+    async def _replace_caption_caches_atomically(
+        self,
+        session_id: str,
+        message_id: str,
+        hashes: list[str],
+        caption: str,
+        image_count: int,
+        sender_name: str,
+        sender_id: str,
+        is_gif: bool = False,
+    ) -> bool:
+        caption = self._strip_gif_human_hint(str(caption).strip())
+        if not session_id or not message_id or not hashes or not caption:
+            return False
+        await self._ensure_caption_db()
+        unique_hashes = list(dict.fromkeys(hashes))
+        placeholders = ",".join("?" for _ in unique_hashes)
+        now = time.time()
+        async with self.caption_db_lock:
+            async with aiosqlite.connect(self.caption_db_path) as db:
+                await db.execute("PRAGMA busy_timeout=10000")
+                try:
+                    await db.execute("BEGIN IMMEDIATE")
+                    cursor = await db.execute(
+                        "SELECT session_id, message_id, position, sha256, image_count, "
+                        "last_seen FROM group_image_fingerprints "
+                        f"WHERE sha256 IN ({placeholders}) ORDER BY last_seen DESC",
+                        unique_hashes,
+                    )
+                    rows = await cursor.fetchall()
+                    candidates = {}
+                    for (
+                        stored_session_id,
+                        stored_message_id,
+                        position,
+                        sha256,
+                        stored_image_count,
+                        last_seen,
+                    ) in rows:
+                        key = (str(stored_session_id), str(stored_message_id))
+                        candidate = candidates.setdefault(
+                            key,
+                            {
+                                "key": key,
+                                "hashes": [],
+                                "image_count": int(stored_image_count),
+                                "last_seen": float(last_seen),
+                            },
+                        )
+                        candidate["hashes"].append((int(position), str(sha256)))
+
+                    current_counter = Counter(hashes)
+                    matched = None
+                    for candidate in sorted(
+                        candidates.values(),
+                        key=lambda item: item["last_seen"],
+                        reverse=True,
+                    ):
+                        candidate_hashes = [
+                            sha256 for _, sha256 in sorted(candidate["hashes"])
+                        ]
+                        if len(hashes) == 1:
+                            if (
+                                candidate["image_count"] == 1
+                                and candidate_hashes == hashes
+                            ):
+                                matched = candidate
+                                break
+                            continue
+                        overlap = sum(
+                            (current_counter & Counter(candidate_hashes)).values()
+                        )
+                        if candidate["image_count"] >= 2 and overlap >= 2:
+                            matched = candidate
+                            break
+
+                    await db.execute(
+                        "DELETE FROM group_image_captions "
+                        "WHERE session_id = ? AND message_id = ?",
+                        (session_id, message_id),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO group_image_captions
+                        (session_id, message_id, image_key, caption, is_gif,
+                         sender_name, sender_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            message_id,
+                            "forced_quote_bundle",
+                            caption,
+                            int(is_gif),
+                            sender_name,
+                            sender_id,
+                            now,
+                        ),
+                    )
+
+                    if matched:
+                        await db.execute(
+                            "UPDATE group_image_fingerprints SET caption = ?, is_gif = ?, "
+                            "hit_count = hit_count + 1, last_seen = ? "
+                            "WHERE session_id = ? AND message_id = ?",
+                            (caption, int(is_gif), now, *matched["key"]),
+                        )
+                    else:
+                        await db.execute(
+                            "DELETE FROM group_image_fingerprints "
+                            "WHERE session_id = ? AND message_id = ?",
+                            (session_id, message_id),
+                        )
+                        await db.executemany(
+                            """
+                            INSERT INTO group_image_fingerprints
+                            (session_id, message_id, position, sha256, caption,
+                             image_count, is_gif, created_at, hit_count,
+                             first_seen, last_seen)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                            """,
+                            [
+                                (
+                                    session_id,
+                                    message_id,
+                                    position,
+                                    sha256,
+                                    caption,
+                                    image_count,
+                                    int(is_gif),
+                                    now,
+                                    now,
+                                    now,
+                                )
+                                for position, sha256 in enumerate(hashes)
+                            ],
+                        )
+                    await self._prune_image_fingerprints(db, now)
+                    await db.commit()
+                except BaseException:
+                    await db.rollback()
+                    raise
         return True
 
     async def _prune_image_fingerprints(self, db, now: float):
@@ -1966,6 +2200,7 @@ class SysSettingPortPlugin(Star):
         structured_enabled = self.config.get("enable_caption_structured", True)
         judge_enabled, judge_provider_id, judge_prompt_tmpl = self.config.get("enable_caption_judge", False), self.config.get("caption_judge_provider_id", ""), self.config.get("caption_judge_prompt", "")
         if structured_enabled: prompt += "\n请务必将最终的图片描述内容包裹在 <caption_result> 标签中。如果无法描述，请输出 <error>原因</error>。"
+        max_retries = max(1, int(max_retries))
         for attempt in range(max_retries):
             try:
                 logger.info(
@@ -1992,20 +2227,33 @@ class SysSettingPortPlugin(Star):
                 caption = raw_text
                 if structured_enabled:
                     import re
-                    if "<error>" in raw_text:
+                    if re.search(r"<error(?:\s[^>]*)?>", raw_text, re.IGNORECASE):
                         logger.warning(
                             f"【图片转述｜Provider 返回错误标签】provider="
-                            f"{self._provider_log_name(provider_id, prov)}, response={raw_text[:300]}"
+                            f"{self._provider_log_name(provider_id, prov)}, "
+                            f"attempt={attempt + 1}/{max_retries}, response={raw_text[:300]}"
                         )
                         continue
-                    match = re.search(r"<caption_result>(.*?)</caption_result>", raw_text, re.DOTALL)
-                    if match:
-                        caption = match.group(1).strip()
-                    else:
+                    match = re.search(
+                        r"<caption_result(?:\s[^>]*)?>(.*?)</caption_result>",
+                        raw_text,
+                        re.DOTALL | re.IGNORECASE,
+                    )
+                    if not match:
                         logger.warning(
                             f"【图片转述｜结构化标签缺失】provider="
-                            f"{self._provider_log_name(provider_id, prov)}，将直接使用原始响应"
+                            f"{self._provider_log_name(provider_id, prov)}, "
+                            f"attempt={attempt + 1}/{max_retries}；本次响应作废并继续重试"
                         )
+                        continue
+                    caption = match.group(1).strip()
+                    if not caption:
+                        logger.warning(
+                            f"【图片转述｜结构化内容为空】provider="
+                            f"{self._provider_log_name(provider_id, prov)}, "
+                            f"attempt={attempt + 1}/{max_retries}；本次响应作废并继续重试"
+                        )
+                        continue
                 if judge_enabled and judge_provider_id and judge_prompt_tmpl:
                     judge_prov = self.context.get_provider_by_id(judge_provider_id)
                     if judge_prov:
@@ -2039,6 +2287,188 @@ class SysSettingPortPlugin(Star):
             if attempt < max_retries - 1:
                 await asyncio.sleep(1.5)
         return ""
+
+    @permission_type(PermissionType.ADMIN)
+    @command("查看转述")
+    async def view_quoted_image_caption_command(self, event: AstrMessageEvent):
+        quote_records = list(
+            event.get_extra("sys_setting_port_quote_records", []) or []
+        )
+        quote_record = next(
+            (record for record in quote_records if record.get("images")),
+            None,
+        )
+        if not quote_record:
+            yield event.plain_result("请先回复一条包含图片的消息，再发送 /查看转述。")
+            return
+
+        session_id = self._group_cache_session_id(event)
+        message_id = str(quote_record.get("message_id") or "").strip()
+        captions = await self._peek_message_captions(session_id, message_id)
+        source = "原消息 ID"
+        if not captions:
+            paths = []
+            for index, image in enumerate(quote_record.get("images", [])):
+                path = await self._resolve_valid_image_path(
+                    event,
+                    image,
+                    kind="view_quote_caption",
+                    index=index,
+                )
+                if path and path not in paths:
+                    paths.append(path)
+            if paths:
+                hashes = await self._hash_image_paths(paths)
+                sha_caption = await self._peek_reusable_image_caption(hashes)
+                if sha_caption:
+                    captions = [sha_caption]
+                    source = "SHA-256 长期库"
+        if not captions:
+            yield event.plain_result("未找到这组图片的已有转述；查看操作不会触发重新转述。")
+            return
+
+        caption_text = "\n".join(
+            f"{index}. {caption}"
+            for index, caption in enumerate(captions, start=1)
+        )
+        yield event.plain_result(f"已有图片转述（来源：{source}）：\n{caption_text}")
+
+    @permission_type(PermissionType.ADMIN)
+    @command("重新转述图片")
+    async def force_recaption_quoted_image_command(self, event: AstrMessageEvent):
+        quote_records = list(
+            event.get_extra("sys_setting_port_quote_records", []) or []
+        )
+        quote_record = next(
+            (record for record in quote_records if record.get("images")),
+            None,
+        )
+        if not quote_record:
+            yield event.plain_result("请先回复一条包含图片的消息，再发送 /重新转述图片。")
+            return
+
+        caption_provider_id = str(
+            self.config.get("caption_provider_id", "") or ""
+        ).strip()
+        if not caption_provider_id:
+            yield event.plain_result("重新转述失败：尚未配置多模态转述模型。")
+            return
+
+        paths = []
+        for index, image in enumerate(quote_record.get("images", [])):
+            path = await self._resolve_valid_image_path(
+                event,
+                image,
+                kind="forced_quote_recaption",
+                index=index,
+            )
+            if path and path not in paths:
+                paths.append(path)
+        if not paths:
+            yield event.plain_result("重新转述失败：无法取得被引用消息中的有效图片。")
+            return
+
+        max_retries = max(1, int(self.config.get("max_retries", 3)))
+        timeout_seconds = max(
+            1,
+            int(self.config.get("caption_llm_timeout_seconds", 90)),
+        )
+        gif_staticization_enabled = bool(
+            self.config.get("enable_gif_frame_staticization", True)
+        )
+        has_gif = gif_staticization_enabled and any(
+            self._is_gif_path(path) for path in paths
+        )
+        visual_paths, gif_converted = self._prepare_visual_image_paths(
+            paths,
+            gif_staticization_enabled,
+        )
+        caption_prompt = self.config.get(
+            "caption_prompt",
+            "请详细描述这张图片的内容，以便纯文本模型能够理解。",
+        )
+        if len(paths) > 1:
+            caption_prompt += (
+                f"\n本条消息包含 {len(paths)} 张图片，请按图片顺序给出一份联合描述并说明它们之间的关系。"
+            )
+        if gif_converted:
+            caption_prompt = f"{caption_prompt}\n\n{self._gif_human_hint()}"
+
+        logger.info(
+            f"【图片重新转述｜触发】message={quote_record.get('message_id')}, "
+            f"images={len(paths)}, provider_images={len(visual_paths)}, "
+            f"gif_staticized={gif_converted}"
+        )
+        caption = await self._try_caption(
+            caption_provider_id,
+            caption_prompt,
+            visual_paths,
+            max_retries,
+            timeout_seconds,
+        )
+        used_provider_id = caption_provider_id
+        fallback_provider_id = str(
+            self.config.get("fallback_provider_id", "") or ""
+        ).strip()
+        if not caption and fallback_provider_id:
+            logger.warning(
+                f"【图片重新转述｜主模型失败】准备调用兜底模型 {fallback_provider_id}"
+            )
+            caption = await self._try_caption(
+                fallback_provider_id,
+                caption_prompt,
+                visual_paths,
+                max_retries,
+                timeout_seconds,
+            )
+            used_provider_id = fallback_provider_id
+        if not caption:
+            yield event.plain_result(
+                "重新转述失败：主模型与兜底模型均未返回有效描述，旧描述已保留。"
+            )
+            return
+
+        message_id = str(quote_record.get("message_id") or "").strip()
+        if not message_id:
+            yield event.plain_result("重新转述失败：无法取得被引用消息 ID，旧描述已保留。")
+            return
+        hashes = await self._hash_image_paths(paths)
+        try:
+            replaced = await self._replace_caption_caches_atomically(
+                self._group_cache_session_id(event),
+                message_id,
+                hashes,
+                caption,
+                len(paths),
+                str(quote_record.get("sender_name") or "未知用户"),
+                str(quote_record.get("sender_id") or ""),
+                is_gif=has_gif,
+            )
+        except Exception as e:
+            logger.error(
+                f"【图片重新转述｜缓存替换失败】message={message_id}, "
+                f"error={type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            yield event.plain_result("重新转述失败：新描述未能写入缓存，旧描述已回滚保留。")
+            return
+        if not replaced:
+            yield event.plain_result("重新转述失败：缓存替换条件不完整，旧描述已保留。")
+            return
+
+        display_caption = (
+            self._with_gif_human_hint(caption) if has_gif else caption
+        )
+        logger.info(
+            f"【图片重新转述｜成功】message={message_id}, "
+            f"provider={used_provider_id}, images={len(paths)}, chars={len(caption)}"
+        )
+        if self.config.get("send_force_recaption_content", True):
+            yield event.plain_result(
+                f"图片描述已重新生成并替换旧缓存：\n{display_caption}"
+            )
+        else:
+            yield event.plain_result("图片描述已重新生成并替换旧缓存。")
 
     @on_llm_request(priority=-maxsize)
     async def inject_group_context_finally(self, event: AstrMessageEvent, req: ProviderRequest):

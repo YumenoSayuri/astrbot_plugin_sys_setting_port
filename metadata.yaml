@@ -1,5 +1,5 @@
 name: astrbot_plugin_sys_setting_port
 author: Nova
-version: 2.3.4
+version: 2.3.6
 description: 系统设置移植 - 会话请求超时、NapCat 即时群聊上下文、持久化群角色感知、多模态转述与自定义等待。支持插件重载自动同步、首轮补偿重试、管理员全量同步和 AI 主动刷新。
 repo: https://github.com/YumenoSayuri/astrbot_plugin_sys_setting_port
